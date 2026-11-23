@@ -1,0 +1,242 @@
+To scale your RAG pipeline to handle 100 to 1,000 simultaneous users uploading 200-page PDFs, you must move away from a synchronous, monolithic Flask application and adopt an Event-Driven, Distributed Microservices Architecture on AWS.
+If 1,000 users upload 200-page PDFs simultaneously in your current code, the server’s RAM will instantly max out, the CPU will hit 100% during the unstructured parsing, and the Google Embedding API will block you for rate limits.
+Here is the exact, step-by-step distributed system design using AWS infrastructure, incorporating queues, caching, databases, and your specific AI logic.
+The "User ID + PDF Hash" Deduplication Strategy
+Before detailing the flow, let's answer your question: Yes, you absolutely need both the User ID and the PDF Content Hash, but they serve entirely different purposes.
+The Content Hash (SHA-256): Used to identify the file itself. If 50 different users upload the exact same 200-page clinical trial, you only want to parse, chunk, and embed it once. The Weaviate Vector Database collection name and the S3 file name will be based only on this Hash.
+The User ID: Used for access control and chat history. You will use a Relational Database (PostgreSQL) to create a mapping: User A -> Hash 123 and User B -> Hash 123. When User A asks a question, the system looks up their User ID, finds they have access to Hash 123, retrieves their specific Chat History, and queries the Weaviate collection for Hash 123.
+
+Step-by-Step Distributed Pipeline Execution
+Phase 1: Upload, Hashing, and Storage (The Web Tier)
+Goal: Accept the files instantly without crashing the web servers.
+Step 1.1: User Upload via Load Balancer
+The user uploads the PDF via your UI. The request hits an AWS Application Load Balancer (ALB), which routes the request to an available Web Server running on Amazon ECS (Elastic Container Service) Fargate. These web servers run your Flask/FastAPI app using Gunicorn.
+Step 1.2: Streaming Hash Calculation
+Instead of loading the entire 200-page PDF into RAM (io.BytesIO) as your old code did, the Web Server calculates the SHA-256 hash in chunks as the file streams in.
+Step 1.3: Database Lookup (Amazon RDS - PostgreSQL)
+The Web Server queries the Amazon RDS (PostgreSQL) database: Does this SHA-256 hash already exist in the Documents table?
+Scenario A (Cache Hit): The document was uploaded by someone else previously. The system simply adds a row to the User_Documents mapping table linking the User_ID to the existing Hash. The user can chat instantly.
+Scenario B (Cache Miss): This is a brand new PDF. Proceed to 1.4.
+Step 1.4: Raw File Storage (Amazon S3)
+The Web Server saves the raw PDF file to an Amazon S3 Bucket (e.g., s3://my-rag-raw-pdfs/<SHA-256-hash>.pdf).
+Step 1.5: Enqueue the Job (Amazon SQS)
+The Web Server creates a message payload containing the S3_URI and the Hash, and pushes it to an Amazon SQS (Simple Queue Service) queue named pdf-processing-queue.
+The Web Server immediately returns a 202 Accepted response to the UI with a job_id. The Web Server is now free to handle the next user.
+
+Phase 2: Asynchronous ETL and Parsing (The Worker Tier)
+Goal: Process heavy PDFs in the background without affecting the live Chat API.
+Step 2.1: Workers Pull from SQS
+A separate fleet of backend worker containers (also on AWS ECS) continuously monitors the SQS Queue. When 1,000 uploads happen, the queue fills up. AWS Auto Scaling detects the large queue and automatically spins up 50 or 100 worker containers. A worker pulls a message from the queue and downloads the PDF from S3 into its local memory.
+Step 2.2: Status Update (Amazon ElastiCache - Redis)
+The worker updates Amazon ElastiCache (Redis) setting the key job_<job_id> to "Status": "Parsing". The UI periodically polls this Redis cache (or uses WebSockets) to show the user a loading bar.
+Step 2.3: Layout-Aware Parsing (unstructured.io)
+The worker runs your partition_pdf(strategy="fast") logic. Because this is happening on isolated worker nodes, if a 200-page PDF consumes 8GB of RAM, it only affects that specific worker container, keeping the rest of your system stable.
+Step 2.4: Intelligent AI Chunking Logic
+The worker executes your proprietary chunking logic exactly as written:
+Iterates through elements.
+Creates chunks up to the 600-token limit.
+Page Awareness: Flushes the buffer when page_number changes.
+Semantic Overlap: Takes the last 2 lines of Page 1 and prepends them to Page 2 (global_last_text_overlap) to ensure semantic continuity across page breaks.
+Phase 3: Embedding and Vector DB Indexing
+Goal: Generate vectors safely and store them for retrieval.
+Step 3.1: Chunk Storage (Optional but recommended)
+The worker saves the raw chunks (as JSON) back to S3. This ensures if the embedding API fails, you don't have to re-run the heavy parsing step.
+Step 3.2: Rate-Limited Embedding Generation
+The worker sends the chunks to the Google Generative AI API (models/text-embedding-004).
+The Problem: 1,000 users * 200 pages = millions of chunks. Google will rate-limit you.
+The AWS Solution: The worker uses a strict Exponential Backoff and Jitter algorithm. If Google returns an HTTP 429 (Too Many Requests), the worker sleeps for 2 seconds, then 4, then 8, up to 60 seconds, preventing the pipeline from failing.
+Step 3.3: Dynamic Vector Insertion (Weaviate on AWS)
+Instead of local Weaviate, you connect to a managed Weaviate Cloud cluster (or self-hosted Weaviate on Amazon EKS).
+The worker uses collection.batch.dynamic() to bulk-insert the Text + Metadata + Google Vectors into a collection named after the SHA-256 Hash.
+Step 3.4: Job Completion
+The worker updates the PostgreSQL database setting the Document status to READY. It updates the Redis cache to COMPLETED. The UI sees this and notifies the user: "Your document is ready to chat!"
+
+Phase 4: The Chat Interface & Real-Time Retrieval
+Goal: Fast, accurate, hallucination-free AI chat using the processed vectors.
+Step 4.1: The User Query (API Gateway -> Web Server)
+The user types: "What are the limitations of this methodology?" The request hits the Web Server with the User_ID, Document_Hash, and Query.
+Step 4.2: Session Management (Amazon ElastiCache)
+In your old code, you used chatbot_cache = {} inside the Flask memory. This is fatal in a distributed system because User A's request might hit Server 1, and their next request might hit Server 2.
+New Logic: The Web Server retrieves the user's Chat History from PostgreSQL or Redis.
+Step 4.3: The Deterministic Semantic Router
+The Web Server passes the query to your _direct_route() logic.
+It normalizes the text.
+It matches it to your _ROUTER_MAP. In this case, it detects the word "limitations" and routes the logic to the limitations_extractor tool.
+Step 4.4: AI Query Rewriting
+If there is chat history, the Web Server passes the history and the query to Meta Llama 4 (hosted on AWS Bedrock or an EC2 instance).
+Logic: It uses the rewrite_chain to transform "What are the limitations?" into a standalone vector query: "What are the limitations of the XYZ methodology described in the document?"
+Step 4.5: Hybrid Search & RRF (Weaviate)
+The Web Server converts the standalone query into a vector using the Google API. It sends this query vector to Weaviate.
+AI Logic: Weaviate executes Hybrid Search. It runs a BM25 Keyword search AND a Dense Vector Cosine Similarity search concurrently.
+It combines both lists using Reciprocal Rank Fusion (RRF), heavily boosting chunks that appear high on both lists. It returns the top k=20 chunks.
+Step 4.6: LLM Generation (Strict Grounding)
+The Web Server takes the top 20 chunks and formats them into the strict limitations_extractor system prompt (e.g., ### Chunk ID: CHUNK_0 \n [Text]).
+It sends this prompt to Meta Llama 4.
+AI Logic: The LLM is forced by the prompt to ignore outside knowledge and output a bulleted list of limitations, citing the chunk IDs (e.g., * Sample size was small [CHUNK_4]).
+Step 4.7: Citation Post-Processing & Response
+The Web Server intercepts the LLM output.
+It uses Regex to find [CHUNK_4].
+It looks up CHUNK_4 in the retrieved Weaviate metadata, extracts page_number: 12.
+It replaces [CHUNK_4] with [p. 12].
+The final, cleaned JSON response is returned via the ALB back to the user's UI. The chat history is saved to PostgreSQL asynchronously.
+Summary of the Data Flow
+Upload: UI → ALB → ECS Web Server → S3 (Raw PDF).
+Queue: ECS Web Server → SQS (Job Payload).
+Status: ECS Web Server → Redis (Status: Queued).
+ETL: ECS Worker pulls from SQS → Downloads from S3 → unstructured.io chunking.
+AI Embeddings: ECS Worker → Google GenAI API (with Exponential Backoff).
+Vector DB: ECS Worker → Weaviate Cluster (Inserts vectors/metadata).
+Finalize: ECS Worker → Updates PostgreSQL & Redis (Status: Ready).
+Chat: UI → ALB → ECS Web Server → Redis (Get History) → Router/Rewriter → Weaviate (Hybrid Search) → Llama 4 (Generation) → Regex Citation Mapping → Returns Answer.
+
+
+
+
+
+
+Phase 5: Monitoring & Troubleshooting Architecture
+In a monolithic app (like running Flask on your laptop), you can just look at the terminal to see errors. In AWS, your application is running across multiple ephemeral containers (ECS). If a container crashes, it is destroyed, and the logs die with it. Therefore, we must decouple logging from the compute instances.
+Step 5.1: Centralized Logging (Amazon CloudWatch Logs)
+The Logic: Every single print statement and logger.error() in your Python code must be captured centrally.
+How it works: You configure your AWS ECS Fargate tasks (both the Web Servers and the Asynchronous Workers) to use the awslogs log driver. Every log generated by your Python code is streamed in real-time to Amazon CloudWatch Log Groups.
+Best Practice: Update your Python logger to output logs in JSON format. Instead of logger.error("Failed to parse PDF"), log {"event": "pdf_parse_failed", "user_id": "123", "hash": "abc...", "error": "MemoryError"}. This allows you to easily search and filter logs using CloudWatch Logs Insights.
+Step 5.2: Distributed Tracing (AWS X-Ray)
+The Logic: When a user uploads a PDF, the request touches the Load Balancer, the Web Server, the SQS Queue, the Worker, the Google API, Weaviate, and the Database. How do you track a single user's request across all these different machines?
+How it works: You implement AWS X-Ray (or OpenTelemetry).
+When a request hits the AWS Application Load Balancer, AWS injects a unique Trace ID (e.g., Trace-ID: 1-67891233-abcdef).
+Your Web Server attaches this ID to the payload sent to the SQS Queue. The Worker picks it up and continues logging with that same ID.
+Troubleshooting Value: In the AWS X-Ray console, you can search a user's Trace ID and see a visual "Waterfall" graph showing exactly how many milliseconds were spent at each step. If the pipeline took 5 minutes, X-Ray will show you that 4.9 minutes were spent waiting on the Google Embedding API.
+Step 5.3: The Safety Net (Amazon SQS Dead-Letter Queues - DLQ)
+The Logic: What happens if a user uploads a corrupted PDF? The ECS Worker will pull the message from the queue, try to parse it with unstructured, and crash. SQS will notice the worker died and put the message back in the queue. Another worker will pick it up and crash. This is an infinite loop that will destroy your system.
+How it works: You configure a Dead-Letter Queue (DLQ). You set a rule: "If a PDF fails processing 3 times, remove it from the main queue and put it in the DLQ."
+Troubleshooting Value: You set up an AWS CloudWatch Alarm that triggers an email/Slack alert whenever MessagesVisible > 0 in the DLQ. You can then inspect the exact PDF that caused the crash without it blocking the other 999 users.
+Step 5.4: Key Metrics & Alarms (Amazon CloudWatch)
+You must monitor the vital signs of your infrastructure. You will set up dashboards and alarms for:
+SQS Queue Depth (ApproximateNumberOfMessagesVisible): If this number goes above 100, your Auto Scaler adds more ECS Workers. If it goes above 1,000, trigger a critical Slack alert—your workers are too slow.
+ECS Memory Utilization: Because unstructured.partition_pdf is highly RAM-intensive, monitor worker memory. If it consistently hits 95%, you need to provision larger Fargate containers (e.g., 16GB RAM instead of 8GB) to prevent Out-Of-Memory (OOM) kills.
+HTTP 429 Errors (Too Many Requests): Monitor how often the Google GenAI API or your Meta Llama 4 endpoint throttles you. If high, you need to increase your exponential backoff sleep times or request a quota increase.
+Real-World Troubleshooting Workflows
+If you get a complaint that the system is broken, here is exactly how you troubleshoot it step-by-step using this architecture:
+Scenario A: The user uploads a 200-page PDF, but the UI is stuck at "Processing..." for 20 minutes.
+Check the Queue: Go to the AWS SQS Console. Check the pdf-processing-queue. Is the queue backed up with thousands of messages?
+Fix: Check if Auto Scaling is working. You might need to increase your maximum allowed worker containers.
+Check the DLQ: Is the user's PDF hash sitting in the Dead-Letter Queue?
+Action: If yes, it means the worker crashed 3 times trying to process it.
+Check CloudWatch Logs: Search the DLQ message's Trace ID or Document Hash in CloudWatch Logs Insights.
+Discovery: You see a Python stack trace: MemoryError thrown by unstructured.
+Fix: The 200-page PDF was too complex (e.g., highly dense tables). You must allocate more RAM to your ECS Worker task definition and replay the message from the DLQ.
+Scenario B: The user asks a question, but gets a HTTP 500 "Internal Server Error" (Your try/except block caught a fatal error).
+Check the Load Balancer (ALB) Logs: Verify the request actually reached your Web Server.
+Check Web Server CloudWatch Logs: Search for the User ID.
+Analyze the Trace: You see the log: ERROR: Weaviate client is not ready.
+Reasoning: The Web Server tried to perform the Hybrid Search, but Weaviate timed out.
+Fix: Check your Weaviate cluster health in AWS. The cluster might be overwhelmed by the 1,000 simultaneous hybrid searches. You need to scale up your Weaviate nodes or increase your database connection timeout limits.
+Scenario C: The chatbot responds, but the citations are hallucinated or missing.
+Check LLM Inputs/Outputs in Logs: Your pipeline relies heavily on Prompt Engineering (e.g., Cite using [CHUNK_ID]). If Llama 4 ignores this, the Regex logic (re.sub) fails.
+Action: Temporarily enable debug logging to print the exact prompt sent to Llama 4 and the exact raw string it returned.
+Discovery: You notice Llama 4 updated its behavior and is outputting (Chunk 4) instead of [CHUNK_4].
+Fix: Update your Python Regex pattern (citation_pattern = r'\[((?:CHUNK...)') to handle the new format, and deploy an update to your Web Servers.
+Scenario D: "EmbeddingGenerationError" triggers frequently.
+Check Logs: You see Failed to get embeddings... after multiple retries in CloudWatch.
+Reasoning: 1,000 users triggered the workers to hit the Google API simultaneously. Google blocked the requests, and your 3-retry loop was exhausted.
+Fix:
+Increase retries from 3 to 10 in your _get_embeddings_from_api function.
+Implement true Exponential Backoff: time.sleep((2 ** attempt) + jitter).
+Contact Google Cloud Support to increase your TPM (Tokens Per Minute) quota for text-embedding-004.
+
+
+
+
+
+
+
+Phase 1: Upload, Hashing & Storage (Web Tier)
+
+User uploads PDF → hits AWS Application Load Balancer (ALB)
+ALB routes request to a Flask/FastAPI Web Server on AWS ECS Fargate
+Web Server calculates SHA-256 hash by streaming the file in chunks (no full RAM load)
+Web Server queries Amazon RDS (PostgreSQL) to check if the hash already exists
+
+Cache Hit → Map User ID to existing hash in DB; user can chat immediately
+Cache Miss → Continue below
+
+
+Save raw PDF to Amazon S3 as <SHA-256-hash>.pdf
+Push a job message (S3 URI + Hash) to Amazon SQS (pdf-processing-queue)
+Return 202 Accepted + job_id to the UI instantly
+
+
+Phase 2: Async ETL & Parsing (Worker Tier)
+
+ECS Worker containers continuously poll the SQS queue
+AWS Auto Scaling spins up more workers based on queue depth
+Worker downloads the PDF from S3 into local memory
+Worker updates Redis (ElastiCache) → job_<id>: "Parsing" (UI shows loading bar)
+Worker runs partition_pdf(strategy="fast") via unstructured.io
+Worker executes chunking logic:
+
+Chunks text up to 600-token limit
+Flushes buffer on page number change
+Prepends last 2 lines of previous page to next page (semantic overlap)
+
+
+
+
+Phase 3: Embedding & Vector DB Indexing
+
+Worker saves raw chunks as JSON back to S3 (failsafe checkpoint)
+Worker sends chunks to Google GenAI API (text-embedding-004) for embedding
+
+On HTTP 429 (rate limit) → Exponential Backoff + Jitter (2s → 4s → 8s… up to 60s)
+
+
+Worker bulk-inserts text + metadata + vectors into Weaviate Cloud via batch.dynamic()
+
+Collection named after the SHA-256 hash
+
+
+Worker updates PostgreSQL → Document status: READY
+Worker updates Redis → job_<id>: "COMPLETED"
+UI notifies user: "Your document is ready to chat!"
+
+
+Phase 4: Chat & Real-Time Retrieval
+
+User sends query → ALB → ECS Web Server (with User ID, Document Hash, Query)
+Web Server fetches chat history from Redis or PostgreSQL
+Semantic Router normalizes and matches query to the correct tool (e.g., limitations_extractor)
+If chat history exists → pass to Meta Llama 4 (via AWS Bedrock) to rewrite query into a standalone vector query
+Web Server converts rewritten query to a vector via Google API
+Weaviate runs Hybrid Search:
+
+BM25 keyword search + Dense vector cosine similarity (concurrent)
+Results combined via Reciprocal Rank Fusion (RRF) → top k=20 chunks returned
+
+
+Top 20 chunks formatted into strict system prompt → sent to Meta Llama 4
+Llama 4 generates grounded response citing chunk IDs (e.g., [CHUNK_4])
+Web Server uses Regex to replace chunk IDs with page numbers (e.g., [p. 12])
+Final JSON response returned to UI via ALB
+Chat history saved to PostgreSQL asynchronously
+
+
+Phase 5: Monitoring & Troubleshooting
+
+Centralized Logging → All ECS container logs streamed to Amazon CloudWatch (JSON format for easy filtering)
+Distributed Tracing → AWS X-Ray assigns a Trace ID per request, carried across ALB → Web Server → SQS → Worker → APIs; visible as a waterfall graph
+Dead-Letter Queue (DLQ) → If a PDF fails processing 3 times, it's moved to the DLQ; CloudWatch Alarm fires a Slack/email alert when DLQ has messages
+CloudWatch Alarms & Dashboards monitor:
+
+SQS queue depth → triggers Auto Scaling of workers
+ECS memory utilization → signals need for larger Fargate containers
+HTTP 429 rate → signals need for quota increase or longer backoff
+
+
+
+
+Troubleshooting Playbook
+
+Stuck at "Processing..." → Check SQS queue depth → Check DLQ → Search Trace ID in CloudWatch → Look for MemoryError → Increase ECS worker RAM → Replay from DLQ
+HTTP 500 on chat → Check ALB logs → Check Web Server CloudWatch logs → Look for Weaviate timeout → Scale up Weaviate nodes
+Hallucinated/missing citations → Enable debug logging → Inspect raw Llama 4 output → Update Regex pattern to match new output format
+Frequent embedding errors → Increase retries to 10 → Implement full Exponential Backoff → Request Google quota increase for text-embedding-004
