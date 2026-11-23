@@ -1,0 +1,63 @@
+Production chunking strategy
+PaperChatBot, from PDF bytes to Weaviate
+This is the path a real upload uses. dump_chunks.py stops after step 8 and writes one JSON record per Docling element. Production continues through the 600-token merge and the embedding store.
+
+1. The API receives a PDF URL. PaperChatBot downloads the file with requests and keeps the bytes in memory.
+2. It hashes those bytes with SHA256. That hash is the Weaviate collection name. The same file is not parsed again when the collection already has objects.
+3. It connects to Weaviate at the host in chatwithpdf/.env. If the collection for this hash already has data, it loads those chunks and skips every step below.
+4. If the collection is empty, _load_and_process_documents starts.
+
+Stage A. Layout parse
+5. _parse_pdf tries Docling 2.150.1 first. The converter runs locally in the Python environment, on CPU unless a GPU is visible to PyTorch.
+6. Docling picture export is turned on (generate_picture_images=True, images_scale=1.0) so each picture can be cropped later. If that option fails, a plain DocumentConverter is used and figures are not described.
+7. Two local models, cached under the Hugging Face hub after the first download, do the layout:
+   - docling-project/docling-layout-heron finds headings, paragraphs, lists, captions, tables, pictures, headers, and footers.
+   - docling-project/docling-models reads the structure of those blocks.
+   - RapidOCR reads characters that exist only as pixels. A diagram with no text layer logs "RapidOCR returned empty result!" and the picture is still kept for the vision step.
+8. documents_from_docling walks Docling's reading order. Each item becomes one element:
+   - section_header and title become element_type Title.
+   - page_header becomes Header.
+   - table becomes Table. The text is Markdown from export_to_markdown, or a dataframe rendered as Markdown.
+   - text, list_item, caption, footnote, formula, and code become NarrativeText.
+   - page_footer is dropped.
+   - An empty item is dropped.
+9. Every kept element stores source, element_type, page_number, and a rectangle. The rectangle comes from Docling's first provenance box. x0,y0 is the lower-left corner and x1,y1 is the upper-right, in PDF points, origin at the bottom-left of the page. A page number missing from Docling becomes page 1.
+10. A picture is not stored as pixels. describe_figure crops it and sends the PNG to Gemini 3.5 Flash on Vertex, location global (VERTEX_VISION_LOCATION). The project and model come from VERTEX_PROJECT and VERTEX_VISION_MODEL. Sign-in is Application Default Credentials.
+11. The vision prompt asks for the figure type and every visible number, in under 180 words, and says to reply SKIP for a logo, decoration, or unreadable image. Images under 80 pixels on a side are skipped with no call. FIGURE_VISION=false skips every call.
+12. A real description is stored as its own element: element_type Figure, text prefixed with "Figure. ", and the picture's rectangle. A SKIP, an empty reply, an HTTP error, or a timeout drops the picture. The caption remains, because Docling labels a caption as text, so it is already a NarrativeText element.
+13. Every real picture in the paper is sent at the same time. FIGURE_VISION_WORKERS defaults to 5, so five figures wait on the slowest call instead of the sum of all five. One Vertex login is shared. HTTP 429 on a single picture is retried up to three times, waiting 20 seconds and then 40 seconds. The read timeout is 120 seconds. A failed picture does not cancel the others.
+14. If Docling throws, or returns no text, the fallback is Unstructured partition_pdf with strategy hi_res and infer_table_structure=True. Table HTML is converted to Markdown. The same fields are stored: source, element_type, page_number, and a box from the element's corner points. Unstructured does not call Gemini, so that fallback has no Figure elements.
+
+Stage B. Section-aware 600-token chunks
+15. Elements are sorted by page_number. This merge uses no model. Token size is estimated as ceil(len(text) / 4). The limit is 600 tokens.
+16. The current section starts as "Front matter". A Title is passed to classify_section. A leading number or Roman numeral is stripped, then the first matching label wins:
+    - References, bibliography, literature cited
+    - Funding/COI: funding, competing interest, conflict of interest, disclosure, acknowledgement
+    - Limitations
+    - Discussion
+    - Results, finding. "Results and Discussion" stays Results because Results is tested first.
+    - Methods: method, materials and methods, study design, experimental procedure, patients and methods
+    - Introduction, background
+    - Abstract, summary
+    A heading that matches none of these does not change the section. The journal name, the word Review, and a DOI stay in the current section.
+17. Narrative text, titles, and headers are appended to a buffer. The running box is the union of the boxes in that buffer. The chunk's element type is the last text-like element in the buffer.
+18. The buffer is flushed, and a chunk is emitted, when any of these happens:
+    - the page number changes
+    - a Title starts a new section
+    - a Table arrives
+    - a Figure arrives
+    - the walk ends
+19. If the flushed text is within 600 tokens, it becomes one chunk. If it is longer, it is split by searching backward from the estimated cut for a period, then a newline, then a space. The cut is a hard character cut only when none of those is found.
+20. Overlap is the last two lines of the previous text chunk. It is copied onto the next chunk of the same section, including across a page break. A new section clears the overlap. A table chunk and a figure chunk are emitted alone, with no overlap carried into the following text.
+21. A table chunk stores the full Markdown as page_content. Before it is emitted, _summarize_table asks the chat model (the private Llama endpoint in LLM_SERVER_URL, model LLM_MODEL) for two sentences. Those sentences are stored as embed_text. If that call fails, the full table text is what gets embedded.
+22. A figure chunk is the Gemini description only. It is not merged into the neighboring paragraphs. The caption stays in the narrative buffer.
+23. Each finished chunk is stamped with creation_date_time, token_size, and section_category. chunk_index is assigned in order, starting at 0.
+24. For a table, embed_text is then set to the two-sentence summary plus the first 400 characters of the table. text_to_embed later sends only embed_text to the embedding model when that field exists. The object stored in Weaviate keeps the full chunk text in the text property.
+
+Stage C. Store
+25. _index_chunks_in_weaviate embeds every chunk with Vertex text-embedding-004, task type RETRIEVAL_DOCUMENT, in batches of 100. Embeddings use VERTEX_LOCATION (us-central1), not the global vision location.
+26. Each object is written to the content-hash collection with text, source, page_number, element_type, token_size, chunk_index, section_category, and x0, y0, x1, y1. The vector is the one just computed. Weaviate's own vectorizer is off.
+27. The raw PDF bytes are then dropped. A later question does not re-parse the file. Retrieval embeds the query with task type RETRIEVAL_QUERY, runs hybrid search for 40 candidates, excludes section_category References, and reranks with the local ncbi/MedCPT-Cross-Encoder down to 8 chunks. That retrieval path is separate from chunking.
+
+What this test file is
+28. chunks/Advances_nutritions.json is the output of stage A for one 15-page review: 221 Docling elements, including 5 Figure records on pages 3, 5, 6, 10, and 11. Stage B and stage C were not run for that file. The paper has no tables, so steps 21 and the table branch of step 18 did not apply.

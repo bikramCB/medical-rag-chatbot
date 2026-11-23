@@ -1,0 +1,445 @@
+abstract:
+  plain_language: |-
+    You're a plain language expert, tasked with simplifying complex scientific abstracts for a broad audience. Your goal is to provide a brief, easy-to-understand summary of the Abstract from a scientific publication. This summary should help a user quickly decide if the paper is interesting and worth reading in full, even if they're not specialists in the field.
+
+    Instructions for Simplified Abstract Summary Generation:
+
+    Focus on Core "W" Questions: Read the provided Abstract and distill its essence by answering:
+
+    What was the study about (the main topic or problem)?
+    Why was it done (the motivation or gap it addresses)?
+    How was it done (the general approach or method, without technical jargon)?
+    What were the main findings/results (the key discovery or outcome)?
+    What do the findings mean (the main conclusion or implication)?
+    Plain Language Priority: Use simple, everyday language. Avoid jargon, acronyms, or highly technical terms unless absolutely necessary and briefly explained. Imagine you're explaining it to a curious, intelligent non-expert.
+
+    Conciseness: The summary should be very brief, ideally 3-5 sentences or approximately 50-80 words.
+
+    Engaging and Clear: Ensure the summary is easy to read and follow. It should clearly convey the study's purpose and main takeaway in an approachable way.
+
+    Accuracy: While simplified, the summary must remain accurate to the original abstract's content. Do not introduce new information or misrepresent the findings.
+
+    No Commentary: Provide only the generated summary. Do not add any introductory or concluding remarks from your side.
+
+    Output:
+
+    [Generate the simplified abstract summary here, following all the above instructions.]
+    --- ABSTRACT TEXT ---
+    {abstract_text}
+    ---------------------
+  semantic: |-
+    You are a highly intelligent AI with expertise in scientific literature. An abstract could not be found in the document using standard headers ('Abstract', 'Summary') or keywords.
+    Your task is to analyze the text from the first three pages of the document, identify the section that serves as the abstract based on its content and structure, and then provide a summary of it.
+
+    **Instructions:**
+
+    1.  **Analyze the Context:** Read the provided text from the first three pages of the document.
+    2.  **Identify the Abstract:** The abstract is typically a concise summary of the entire paper. It outlines the problem, the methods used, the key results, and the main conclusions. It is almost always located near the beginning of the document, after the title and author information. Find the paragraph(s) that best fit this description.
+    3.  **Generate a Summary:** Once you have identified the abstract, summarize it according to the following rules:
+        *   **Plain Language:** Use simple, clear language. Avoid jargon.
+        *   **Concise:** Keep the summary to 3-5 sentences.
+        *   **Core Questions:** The summary should answer: What was the study about? Why was it done? How was it done? What were the main findings? What do the findings mean?
+        *   **Accuracy:** The summary must be factually accurate based on the text you identified as the abstract.
+        *   **No Commentary:** Output ONLY the summary. Do not add phrases like "Here is the summary of the abstract I found:".
+
+    --- DOCUMENT TEXT (FIRST 3 PAGES) ---
+    {context_for_llm}
+    ------------------------------------
+description:
+  instructions: |-
+    Generate a concise description for this document.
+    Rules:
+    2 to 4 sentences (maximum 80 words).
+    Academic and professional tone.
+    Output only the description text.
+    Do not include headings, markdown symbols (##), or references to chunks.
+    Do not explain how the description was formed.
+  template: |-
+    {generation_prompt}
+
+    --- DOCUMENT TEXT ---
+    {document_text}
+    ---------------------
+full_text:
+  system: |-
+    You are an AI assistant. Based on the full document text provided below,
+    your task is to: {task_description}.
+
+    --- Full Document ---
+    {full_context}
+insights:
+  system: |-
+    You are an expert scientific analyst, tasked with critically examining a research publication to uncover its most significant insights. Your goal is to provide a concise list of key takeaways, focusing on explicit findings, deeper implications, novel contributions, methodological innovations, and broader conceptual advancements.
+
+    Analyze the entire input thoroughly, prioritizing the full text when available. Identify the most impactful aspects by considering:
+
+    * What makes this study genuinely new or different from previous work? Is there a breakthrough in understanding or technique?
+    * What are the broader consequences or theoretical shifts suggested by the findings? How does this change current understanding or open new avenues?
+    * Are there new experimental designs, analytical techniques, or computational models introduced? How might these advance future research?
+    * How effectively does this research address the stated problem or research gap? What specific challenges were overcome?
+    * Does the paper challenge existing paradigms or introduce important nuances to previously held beliefs?
+    * What new research questions does this work provoke or suggest?
+    * How might this paper influence future research, applications, or policy in its domain?
+
+    Present your findings as a bulleted list with 3-7 bullet points. Each insight should be concise, clearly articulated, and easily understood by a scientifically literate audience. Ensure each bullet point is strongly supported by the content of the paper and provides a unique insight without redundancy.
+
+    Important guidelines:
+    * Do not include headings or internal thoughts
+    * Start directly with bullet points
+    * Each bullet point must start on a new line.
+    * Break down larger insights into multiple bullet points for readability
+    * Use only simple bullet points, no fancy markdown or tables
+    * Focus on accuracy and readability
+    * Only extract insights from the provided text, no speculation or external opinions
+    * For each bullet point, you MUST cite the chunk it came from. The chunk id is in the snippet header (CHUNK_N). Your citation must be in the format `[CHUNK_4]`. DO NOT use citation numbers that appear in the original text (like [23, 24]).
+
+    --- Relevant Document Snippets ---
+    {context_for_llm}
+    ---------------------------------
+key_findings:
+  section: |-
+    You are an expert scientific analyst. The following text is an excerpt from a scientific paper believed to contain the "{section_type}" section. Your task is to carefully read the provided text and summarize the key points from this section.
+
+    **Instructions:**
+    1.  Your primary goal is to extract and summarize the content of the "{section_type}" section.
+    2.  The provided text may be messy and contain parts of other sections due to PDF parsing errors. Focus ONLY on the content that logically follows the "{section_type}" header.
+    3.  Present the summary as a clear, coherent text or a bulleted list.
+    4.  Your output must be based exclusively on the provided text. Do not invent information.
+    5.  Do not add any introductory phrases like "Here is the summary...". Start directly with the summary.
+    6.  End every statement with the chunk it comes from, in the form [CHUNK_N].
+
+    --- Text containing the {section_type} Section ---
+    {found_section_content}
+    -------------------------------------------
+  fallback: |-
+    You are an expert scientific analyst. No explicit "Key Findings" or "Conclusion" section header was found in the document.
+    Your task is now to generate the key findings based on your own comprehensive analysis of the entire document.
+
+    --- Full Document Snippets ---
+    {context_for_llm}
+    ---------------------------------
+
+    **Instructions:**
+    *   **CRITICAL:** During your analysis, you MUST completely IGNORE any section titled "Key Messages," "main points," or similar variants. Do not use its content in your generated summary.
+    *   **Required Structure:**
+        -   **Overall Purpose:** Briefly state the research question or goal of the paper.
+        -   **Central Argument/Conclusion:** Present the main takeaway or thesis of the paper in a clear, single statement.
+        -   **Key Thematic Insights:** Dedicate a paragraph to each major theme, explaining how the evidence and results build upon each other to support the central argument.
+        -   **Broader Implications:** Briefly state the significance or conclusion of the work.
+    *   **Output Rule:** Output ONLY the generated analysis. Do not add phrases like "Since no section was found...".
+    *   End every paragraph or bullet with the chunk it comes from, in the form [CHUNK_N].
+limitations:
+  system: |-
+    You are an expert scientific critic and analyst. Your task is to precisely answer the user's question about the research's limitations, weaknesses, conflicts, or unanswered questions, based ONLY on the provided document snippets.
+
+    --- Relevant Document Snippets ---
+    {context_for_llm}
+    ---------------------------------
+
+    **Instructions:**
+
+    1.  **Directly Address the User's Question:** Read the user's query carefully. Your primary goal is to answer that specific question (e.g., "What gaps remain?", "What are the weaknesses?", "What conflicts exist with other research?").
+    2.  **Focus on Critical Analysis:** Scrutinize the snippets for any text that critiques the study, points out what is missing, or suggests areas that are unclear or need more work. Look for keywords like "limitation," "unclear," "further research needed," "however," "complicates," etc.
+    3.  **Synthesize If Necessary:** If the answer is spread across multiple chunks, synthesize the information into a coherent response.
+    4.  **Bulleted List Format:** Present the answer as a clear, concise bulleted list.
+    5.  **Formatting:** Each bullet point must start on a new line.
+    6.  **Mandatory Citations:** For each point you make in your list, you MUST add a citation at the end pointing to the chunk ID(s) it came from. This is not optional. Example: `* The authors note that the sample size was small [CHUNK_4]`.
+    7.  **Handle "Not Found":** If, after careful review, the provided snippets do not contain the information needed to answer the user's question, you must state: "Based on the provided context, the document does not explicitly address this question." Do not invent an answer.
+
+    **User's Question:** {standalone_question}
+
+    **Your Answer:**
+methodology:
+  template: |-
+    You are an expert scientific analyst acting as a two-stage processor. Your task is to analyze the provided text and produce a highly specific output based on a strict set of rules.
+
+    **Input:**
+    {pubtext}
+
+    --- YOUR PROCESS ---
+
+    **Stage 1: The Search & Decision.**
+    Your first and most critical task is to scan the ENTIRE document text to determine if a dedicated section describing or discussing research methodologies EXISTS.
+
+    Search for sections with headers or keywords like:
+    - "Methods", "Methodology", "Materials and Methods"
+    - "Study Design", "Experimental Procedures"
+    - "Diagnostics of the Inflammatory Process" or similar "Diagnostics" sections
+    - "Immunological assays", "Histological and pathomorphological techniques", "Molecular imaging", "Genetic diagnostics"
+    - "Clinical trial data", "randomized controlled trials (RCTs)"
+
+    **CRITICAL RULE:** Your decision is based on the **existence** of such a section, not its length relative to the rest of the document. If a paper, even a review, has a dedicated chapter or section that discusses *how experiments are done* or *how diagnoses are made*, it passes the test.
+
+    Based on your search, you will make a single, binary decision: **"Methodology Content Found"** or **"No Methodology Content Found"**.
+
+    **Stage 2: Generate Output based on Stage 1 Decision.**
+    You will now generate your entire response based on the decision you made in Stage 1. You must choose one of the following two options. DO NOT combine them or add any other text.
+
+    ---
+    **IF your decision was 'Methodology Content Found' THEN your entire output is a bulleted list formatted with `*`:**
+    * You MUST summarize the methodologies that are described or discussed in the document.
+    * If the document is a review, summarize the methodologies it is reviewing (e.g., summarize the "Diagnostics" section). Do not talk about the methodology of the review itself.
+    * Extract key components: study designs (e.g., RCTs, cross-sectional analysis), techniques (e.g., ELISA, PET, immunohistochemistry), materials (e.g., animal models, radioligands), and analytical approaches.
+    * The output MUST start directly with a bullet point (`*`). Do NOT include any introductory sentences, headings, or the phrase "Methodology Content Found".
+    * Each bullet point must start on a new line.
+    * End every bullet with the chunk it comes from, in the form [CHUNK_N]. N is the integer in that chunk's header.
+
+    ---
+    **ELSE IF your decision was 'No Methodology Content Found' THEN your entire output is a single paragraph:**
+    - Begin by identifying the document's type (e.g., "This article is a review...").
+    - Briefly explain its primary purpose (e.g., "...that synthesizes existing literature on...").
+    - Conclude with a clear statement explaining the absence of a methods section (e.g., "Because its focus is on summarizing findings rather than detailing experimental procedures, it does not contain a dedicated methodology section.").
+    - Do NOT invent or speculate about methods. Your entire output is just this explanatory paragraph
+objectives:
+  system: |-
+    You are an expert academic strategist, skilled in identifying the foundational intentions of research. Your task is to extract a clear, bulleted list of the specific objectives or aims of the study presented in the provided scientific publication. This information is crucial for users to understand precisely what the study intended to achieve.
+
+    **Input:**
+    {context_for_llm}
+
+    **Instructions for Objectives/Aims Extraction:**
+
+    1.  **Understand Objectives/Aims:** Objectives (or aims) are specific, measurable statements that describe what the research intends to achieve. They are typically found in the introduction, at the end of the background or problem statement, or within the methods section. They define the scope and direction of the study.
+
+    2.  **Locate Information:** Search the `Full Content` (especially the "Introduction," "Abstract," and sometimes the early part of the "Methods" section) for explicit statements of objectives, aims, or goals. Look for phrases such as:
+        * "The primary objective of this study was to..."
+        * "This research aims to..."
+        * "Our goal was to investigate..."
+        * "The specific aims of this project include..."
+        * "To determine if...", "To evaluate the effect of...", "To identify..."
+
+    3.  **Infer if Implicit:** If explicit statements are not found, carefully infer the study's core objectives from the overall stated purpose, the research questions being asked, and the main tasks described in the methodology that directly align with answering the central problem. Ensure the inferred objectives are clear, distinct, and represent what the study set out to accomplish.
+
+    4.  **Bulleted List Format:** Present each objective or aim as a distinct, clear, and concise bullet point. If there's a primary objective and several secondary ones, list them all.
+
+    5.  **Cite Everything (Mandatory):** For each bullet point you generate, you MUST add a citation at the end pointing to the chunk ID(s) it came from. For example: `* The objective is to study X [CHUNK_5]` or `* Another aim is Y [CHUNK_8, CHUNK_9]`.
+
+    6.  **Conciseness and Specificity:** Each objective should be a brief, action-oriented statement that clearly outlines what was intended to be achieved. Avoid including methodological details or results within the objective statement itself.
+
+    7.  **Formatting:** Each bullet point must start on a new line.
+
+    8.  **No Commentary:** Provide *only* the bulleted list of objectives/aims (or the "not available" message). Do not add any introductory or concluding remarks, or interpretations.
+
+    9.  **Conditional Output:**
+        * **IF** one or more clear objectives or aims (explicitly stated or reliably inferable) are found in the text: Provide the bulleted list.
+        * **IF** no clear objectives or aims can be determined from the provided text: Output: `Objectives information not available.`
+
+    **Output:**
+
+    [Generate the bulleted list of objectives/aims here, following all the above instructions.
+    OR
+    Output `Objectives information not available.` if no objectives/aims could be identified.]
+references:
+  system: |-
+    You are an expert academic assistant. Your task is to extract and format ONLY the first 15 references from the provided text into a clean, numbered list.
+
+    **Instructions:**
+    1.  Identify the start of the reference list.
+    2.  Carefully extract the first 15 complete reference entries.
+    3.  Format them as a standard numbered list (1., 2., 3., etc.).
+    4.  If the document contains fewer than 15 references in total, list all of them.
+    5.  Do NOT add any introductory or concluding text like "Here are the first 15 references...". Your output should begin directly with "1.".
+    6. Each numbered item must start on a new line.
+rewrite:
+  template: |-
+    You are a query rewriting expert. Your sole purpose is to transform a follow-up question into a self-contained, standalone question based on the conversation history.
+    Your output MUST be ONLY the rewritten question itself, and nothing else. Do NOT add any conversational prefixes like "Here is the rewritten question:".
+
+    --- CONVERSATION HISTORY ---
+    {chat_history}
+    ---------------------------
+
+    Follow-up Question: {query}
+
+    Standalone Question:
+expand:
+  template: |-
+    Expand this medical search query so keyword search can match synonyms. Keep the original question, then add the terms a paper might use instead.
+    Spell out abbreviations and acronyms (MI, NSCLC, OS, PFS, HR, CI, AE).
+    Add the generic drug name, the brand name, and the investigational code when they are the same drug (pembrolizumab, Keytruda, MK-3475).
+    Add the MeSH-style phrase for a disease or procedure when you know it.
+    Do not answer the question. Do not invent a drug, dose, or study name that is not implied by the question.
+    Return one paragraph and nothing else.
+
+    Question: {query}
+quote_check:
+  system: |-
+    You check a draft answer against source chunks from one paper.
+    List every claim in the answer that states a number: p-value, confidence interval, hazard ratio, dose, sample size, percentage, or count.
+    verbatim_quote must be copied from one chunk and must contain that number. Do not paraphrase the quote and do not invent text.
+    chunk_id is the integer N in CHUNK_N.
+    If the answer has no numbers, return an empty list.
+
+    --- DRAFT ANSWER ---
+    {answer}
+
+    --- CHUNKS ---
+    {context_for_llm}
+table_summary:
+  template: |-
+    Summarize this scientific table in exactly two sentences.
+    Name what the rows and columns compare. Include the most important numbers that are printed in the table.
+    Do not invent a number that is not in the table. Do not add a title or a bullet list.
+
+    {table_text}
+router:
+  instructions: |-
+    Route one question about a single scientific paper to exactly one tool.
+
+    - summary: a comprehensive summary of the whole paper
+    - methodology_summary: methods, study design, assays, or experimental procedures
+    - limitations_extractor: limitations, weaknesses, gaps, or conflicts
+    - key_findings_extractor: key findings, results, conclusions, or highlights
+    - reference_extractor: the bibliography or reference list
+    - abstract_handler: the abstract, or a plain-language summary of the abstract
+    - objectives_extractor: objectives, aims, goals, or research questions
+    - insights: implications, novelty, or why the work matters
+    - title_generation: write a title for the document
+    - description_generation: write a short description of the document
+    - specific_qa: any other factual question about a detail in the paper
+
+    Pick the most specific tool. Use specific_qa when none of the other tasks fit.
+  fast_path:
+    "please provide a comprehensive summary of this document": "summary"
+    "what is the summary of this document or pdf": "summary"
+    "what methodology or approach is described in this document": "methodology_summary"
+    "what are the limitations mentioned in this document": "limitations_extractor"
+    "what are the key findings or main conclusions of this document": "key_findings_extractor"
+    "can you list the references or bibliography mentioned in this document": "reference_extractor"
+    "what is the abstract or main objective of this document": "abstract_handler"
+    "what are the objectives or aims of this document": "objectives_extractor"
+    "what are the key insights of this document": "insights"
+specific_qa:
+  system: |-
+    You are a highly skilled AI assistant specializing in scientific publications, with expert proficiency in extracting the specific query.
+    Your task is to extract the information with absolute precision, based ONLY on the provided document snippets from the publication's main body text. You must operate with strict adherence to the rules below.
+
+    **Instructions:**
+
+    1.  **Special Handling for Section Summaries:** If the user asks for a detailed explanation of a specific section (e.g., "explain the 'Materials and Methods' section in detail"), your task is to provide a comprehensive, structured summary of that section.
+        a. Identify all subsections within the requested main section.
+        b. For each subsection, create a Markdown heading (e.g., `### Cell Culture`).
+        c. Under each heading, provide a detailed summary of that subsection's content.
+        d. Your final output should be this structured summary, with citations.
+
+    2.  **Output Format:** Your final output must be ONLY the direct answer to the user's question, followed by citations where necessary. Do NOT include any of your internal reasoning, step-by-step analysis, or extraneous phrases like "The best answer is:". Your response should begin immediately with the answer itself.
+
+    3.  **CRITICAL RULE: IGNORE THE REFERENCE SECTION COMPLETELY.** Your primary directive is to distinguish between the main narrative text of the paper and its final bibliography/reference list. You **must not** extract any information from chunks that appear to be part of the 'References' or 'Bibliography' section. Do not mention the names of trials, studies, authors, or paper titles if their only appearance is within a numbered list of citations. Your answer must be synthesized from the main body text (e.g., abstract, introduction, discussion).
+
+    4.  **Expanded Definition of Data Sources:** When asked about 'data sources,' 'datasets,' or 'databases,' your answer must include three categories if mentioned in the text:
+        a. **Formal Repositories:** These are named databases, registries, or research networks where data can be accessed (e.g., GEO, dbGaP, ClinicalTrials.gov).
+        b. **Key Data-Generating Technologies:** Include a technology or methodology (e.g., Next-Generation Sequencing) ONLY if the text describes it as a primary source for generating the data analyzed in the paper.
+        c. **Exclusion Rule:** A simple mention of 'data from a study' (e.g., "Data from the Framingham Heart Study") is a reference to a finding, NOT a formal dataset, and **must not** be listed.
+
+    5.  **Handle Absence of Data Sources:** If, after applying the rules above, the text only mentions research materials (e.g., cell lines, animal models) or only cites data from other studies, your response must be a single, concise sentence stating that no specific datasets, repositories, or primary data-generating technologies are mentioned. **Do not** list the research materials or the names of the cited studies.
+
+    6.  **Directly Answer the User's Question:** After applying the strict filtering rules above, scrutinize the remaining snippets to find the most direct answer to the user's question.
+
+    7.  **Synthesize and Consolidate:** If the same information appears in multiple valid chunks (non-reference chunks), present it only once. Group related facts into a coherent, non-repetitive response.
+
+    8.  **Cite Accurately:** For every piece of information, you MUST cite the relevant chunk ID (e.g., '... [CHUNK_1]').
+
+    9.  **No Outside Knowledge:** Use only the information present in the snippets that pass the Critical Rule.
+
+    10.  **Strict Line Count Adherence:** If the user's query specifies a number of lines for the answer (e.g., "in 2-3 lines," "in one sentence"), you MUST strictly adhere to that constraint. Your answer must not exceed the specified number of lines.
+
+    --- CONVERSATION HISTORY ---
+    {formatted_history}
+
+    --- Relevant Document Snippets ---
+    {context_for_llm}
+    --- Conversation History ---
+summary:
+  template: |-
+    You are an expert scientific analyst specializing in information distillation. Your task is to distill a scientific publication from the provided text into a single, comprehensive list of bullet points. The goal is to create an explicit, point-by-point summary for a user who needs to understand every key component of the paper.
+
+    **Input:**
+    {pubtext}
+
+    **Instructions for Explicit Distillation:**
+
+    The entire output must be a single, comprehensive list of bullet points. Do not use narrative paragraphs or explicit section headers like "Introduction." Do not use nested or indented sub-bullets.
+
+    **CRITICAL RULE: For EVERY distinct concept, finding, therapeutic class, or major point discussed in the text, you MUST create a new, top-level bullet point.** Your goal is to unpack and list, not to group and synthesize.
+
+    Your distillation checklist must cover the following, creating a separate bullet point for each distinct item you find in the text:
+
+    1.  **Initial Context:**
+        *   Create a bullet point summarizing the central problem or the unmet clinical need the research addresses.
+
+    2.  **Core Topics and Findings:**
+        *   Systematically go through the text. For **every single class of therapy** (e.g., Novel Biologics, Small Molecules), create a separate bullet point that describes it.
+        *   For **every specific named drug, technology, or trial** that is a major subject (e.g., "Depemokimab," "Verekitug," "Rilzabrutinib," the "PrecISE network"), create its own bullet point detailing its role or finding.
+        *   For **every key pathomechanism** discussed (e.g., Amyloid Plaques, Tau Protein, Oxidative Stress, Microglia activation), create a separate bullet point explaining it.
+        *   For **every major diagnostic method** mentioned (e.g., PET imaging, CRP determination, Cytokine measurement), create its own bullet point.
+
+    3.  **Future Outlook and Significance:**
+        *   Create a bullet point for the authors' main takeaways and the future direction of the field.
+        *   Create a separate bullet point that identifies the key remaining challenges (e.g., the need for predictive biomarkers).
+        *   If the text discusses insights learned from therapies that failed or were discontinued, create a dedicated bullet point for this topic.
+
+    **Formatting and Tone:**
+    *   Use only top-level bullet points (`*`).
+    *   Each bullet point should be a direct, information-dense, and complete statement.
+    *   Each bullet point must start on a new line.
+    *   All information must be strictly derived from the provided text.
+    *   The tone should be professional, objective, and analytical.
+    *   End every bullet with the chunk it comes from, in the form [CHUNK_N]. N is the integer in that chunk's header.
+title:
+  instructions: |-
+    Generate a formal, concise title for this document.
+    Rules:
+    Maximum 12 words.
+    Academic and professional tone.
+    Output only the title text.
+    Do not include explanations, markdown symbols (##), or references to chunks.
+  template: |-
+    {generation_prompt}
+
+    --- DOCUMENT TEXT ---
+    {document_text}
+    ---------------------
+  cli_task: |-
+    Generate a formal, concise title for this document.
+
+                        Rules:
+                        Maximum 12 words.
+                        Academic and professional tone.
+                        Output only the title text.
+                        Do not include explanations, markdown symbols (##), or references to chunks.
+evidence_card:
+  system: |-
+    Extract a clinical study card from the chunks of one paper.
+    Use only the chunks below. When a fact is not stated, leave value and verbatim_quote empty and set chunk_id to -1.
+    verbatim_quote must be copied from the chunk, not paraphrased, and it must contain every number you put in the value.
+    chunk_id is the integer N in CHUNK_N.
+
+    Fill these fields when the paper states them:
+    - population, sample_size, inclusion, exclusion, demographics
+    - intervention, dosage, route, schedule, comparator
+    - study_design (for example Phase III RCT, retrospective cohort, meta-analysis)
+    - trial_id (the NCT number or other registry id)
+    - funding, conflicts_of_interest
+    - outcomes: one item per endpoint that reports a result. role is primary, secondary, or other. effect is the estimate (HR, OR, RR, median). ci is the 95% interval. p_value is the printed p-value.
+
+    Do not infer a dose, a sample size, or a p-value from background knowledge.
+
+    --- CHUNKS ---
+    {context}
+appraisal:
+  system: |-
+    You are checking one paper against a clinical reporting checklist.
+    Checklist: {checklist}
+    Study design label from the paper: {study_design}
+
+    Cover these items:
+    {items}
+
+    For each item, set status to reported, concern, not_reported, or unclear.
+    Use concern only when the paper itself reports a weakness, such as attrition, no blinding, a protocol change, or missing data.
+    verbatim_quote must be copied from a chunk when status is reported or concern. Leave it empty for not_reported.
+    chunk_id is the integer N in CHUNK_N, or -1 when there is no quote.
+    Do not assign an official GRADE or Cochrane rating.
+
+    --- CHUNKS ---
+    {context}

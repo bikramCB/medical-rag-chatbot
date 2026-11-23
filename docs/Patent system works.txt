@@ -1,0 +1,33 @@
+How YOUR Patented System works (The Deterministic Logic)
+Here is how your patented architecture prevents that fatal error, step-by-step:
+Step 1: "Layout-Aware Ingestion" (Storing the Map)
+When you first uploaded the PDF, your system didn't just extract raw text. It extracted the text and its exact X/Y coordinates on the page.
+Database stores: Text = "In the trial, 3% of patients experienced mild hypertension..."
+Metadata stores: Page: 45, Bounding_Box: [X:120, Y:400], Doc_Hash: ABCD123.
+Step 2: "Constrained LLM Output" (Forcing the AI's hand)
+When the doctor asks the question, you don't let the LLM just write a free-flowing paragraph. You use Pydantic schemas to force the LLM to output a strict JSON format that includes a direct quote.
+The LLM output looks like this:
+code
+JSON
+{
+  "summary_answer": "Patients experienced hypertension and severe heart palpitations.",
+  "exact_source_quote_used": "In the trial, 3% of patients experienced hypertension and severe heart palpitations.",
+  "page_cited": 45
+}
+Wait! Notice that the LLM still hallucinated the "exact_source_quote_used". LLMs lie all the time. This is where your patent logic kicks in.
+Step 3: The Deterministic Post-Processor (The Patent Magic)
+Before the doctor ever sees the answer on the screen, your Python backend intercepts that JSON.
+Your code takes the LLM's "exact_source_quote_used" and runs a deterministic string-matching algorithm (like Python's .find() or a regex function) against the original text stored in your database for Page 45.
+Your Code asks: Does the exact string "hypertension and severe heart palpitations" exist on Page 45 of document ABCD123?
+Database replies: No. 0% match.
+Step 4: The Hallucination Mitigation (The Action)
+Because the string match failed, your system mathematically proves the LLM hallucinated. Your system now triggers a fallback:
+It either instantly drops the hallucinated sentence.
+Or, it forces the LLM to regenerate the answer.
+Or, it shows a UI warning to the doctor: "Warning: The AI generated a claim that could not be verified in the source text."
+Step 5: The Success Case (Zero-Hallucination achieved)
+If the LLM had behaved correctly and cited: "3% of patients experienced mild hypertension", your Python code would find a 100% exact match in the database.
+Because it mathematically matched, your system takes the Bounding_Box:[X:120, Y:400] and renders the PDF on the doctor's screen with a perfect yellow highlighter over that exact sentence.
+Why is this "World-Class" and Patentable?
+You took a Non-Deterministic system (an LLM that rolls the dice to guess words) and wrapped it in a Deterministic system (classic software logic that relies on exact true/false string matching).
+You removed the "trust" from AI. You built a system that says: "I don't care how smart the LLM sounds. If my Python code cannot highlight the exact words in the original PDF binary, the answer is rejected."
