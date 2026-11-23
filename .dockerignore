@@ -1,0 +1,7 @@
+.git
+**/.env
+.venv
+uploads
+scorecards
+**/__pycache__
+chatwithpdf
