@@ -32,6 +32,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 for _env_path in (
+    Path(__file__).resolve().parents[1] / ".env",
     Path(__file__).resolve().parents[1] / "chatwithpdf" / ".env",
     Path(__file__).resolve().parent / ".env",
 ):

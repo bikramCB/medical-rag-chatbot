@@ -15,7 +15,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Check that the Python files parse
-        run: python -m compileall -q src
+        run: python -m compileall -q chatwithpdf/src
       - name: Test the scorecard interval checks
         run: |
           pip install pytest

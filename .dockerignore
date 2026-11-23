@@ -4,4 +4,10 @@
 uploads
 scorecards
 **/__pycache__
-chatwithpdf
+chatwithpdf/papers
+chatwithpdf/docs
+chatwithpdf/test.ipynb
+chatwithpdf/README.md
+chatwithpdf/requirements.txt
+chatwithpdf/.gitignore
+dump_chunks.py
