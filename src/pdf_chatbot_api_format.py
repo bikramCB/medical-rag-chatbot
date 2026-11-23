@@ -44,9 +44,42 @@ from evidence import extract_evidence_card, load_cached_card, save_card
 from stats_audit import audit_claim
 from weaviate_store import EmbeddingGenerationError, WeaviateStoreMixin, rerank_documents
 
-LLM_SERVER_URL = os.getenv("LLM_SERVER_URL")
-LLM_API_KEY = os.getenv("LLM_API_KEY")
-LLM_MODEL_NAME = os.getenv("LLM_MODEL")
+
+def vertex_chat_model():
+    """Gemini on Vertex for every text step. Figures keep the separate vision model."""
+    import httpx
+    import google.auth
+    from google.auth.transport.requests import Request as AuthRequest
+
+    credentials, detected_project = google.auth.default(
+        scopes=["https://www.googleapis.com/auth/cloud-platform"]
+    )
+    project = os.getenv("VERTEX_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT") or detected_project
+    # This project can call gemini-3.5-flash on the global endpoint. Flash-Lite is not enabled.
+    location = os.getenv("VERTEX_CHAT_LOCATION") or os.getenv("VERTEX_VISION_LOCATION") or "global"
+    model = os.getenv("VERTEX_CHAT_MODEL") or os.getenv("VERTEX_VISION_MODEL") or "gemini-3.5-flash"
+    if not project:
+        raise RuntimeError("Set VERTEX_PROJECT or GOOGLE_CLOUD_PROJECT for Vertex Gemini.")
+    if not model.startswith("google/"):
+        model = f"google/{model}"
+    host = "https://aiplatform.googleapis.com" if location == "global" else f"https://{location}-aiplatform.googleapis.com"
+    base_url = f"{host}/v1/projects/{project}/locations/{location}/endpoints/openapi"
+
+    def _bearer(request):
+        if not credentials.valid:
+            credentials.refresh(AuthRequest())
+        request.headers["Authorization"] = f"Bearer {credentials.token}"
+
+    print(f"Chat model: Vertex {model} in {location}.")
+    return ChatOpenAI(
+        model=model,
+        base_url=base_url,
+        api_key="vertex",
+        temperature=0.0,
+        max_tokens=4096,
+        extra_body={"google": {"thinking_config": {"thinking_budget": 0}}},
+        http_client=httpx.Client(event_hooks={"request": [_bearer]}, timeout=120),
+    )
 
 _PROMPTS = yaml.safe_load(Path(__file__).with_name("prompts.yml").read_text(encoding="utf-8"))
 
@@ -363,14 +396,7 @@ class PaperChatBot(WeaviateStoreMixin, ChunkingMixin):
                 pass
         atexit.register(cleanup_temp)
 
-        self.llm = ChatOpenAI(
-            model=str(LLM_MODEL_NAME),
-            max_tokens=4096,
-            api_key=str(LLM_API_KEY),
-            base_url=str(LLM_SERVER_URL),
-            default_headers={'apikey': str(LLM_API_KEY)},
-            temperature=0.0
-        )
+        self.llm = vertex_chat_model()
 
         self.rewrite_chain = self._create_rewrite_chain()
         self.last_interaction_time = time.time()
