@@ -62,8 +62,20 @@ def matrix_rows(cards) -> list:
             "comparator": _value(card, "comparator"),
             "trial_id": _value(card, "trial_id"),
             "funding": _value(card, "funding"),
+            "median_os_pfs": _value(card, "median_os_pfs"),
+            "grade_3_plus_ae": _value(card, "grade_3_plus_ae"),
+            "key_limitations": _value(card, "key_limitations"),
             "conflicts_of_interest": _value(card, "conflicts_of_interest"),
             "primary_outcomes": outcomes,
+            "field_meta": {
+                "study_design": _field_meta(card, "study_design"),
+                "sample_size": _field_meta(card, "sample_size"),
+                "intervention": _field_meta(card, "intervention"),
+                "comparator": _field_meta(card, "comparator"),
+                "median_os_pfs": _field_meta(card, "median_os_pfs"),
+                "grade_3_plus_ae": _field_meta(card, "grade_3_plus_ae"),
+                "key_limitations": _field_meta(card, "key_limitations"),
+            },
         })
     return rows
 
@@ -132,4 +144,16 @@ def build_matrix(cards) -> dict:
         "rows": rows,
         "contradictions": compared["contradictions"],
         "consensus": compared["consensus"],
+    }
+
+
+def _field_meta(card: dict, name: str) -> dict:
+    field = card.get(name) or {}
+    if not isinstance(field, dict):
+        return {"value": "", "page": None, "chunk_index": None, "bbox": None}
+    return {
+        "value": field.get("value") or "",
+        "page": field.get("page"),
+        "chunk_index": field.get("chunk_index"),
+        "bbox": field.get("bbox"),
     }

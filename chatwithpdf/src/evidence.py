@@ -30,6 +30,9 @@ _FIELD_NAMES = (
     "trial_id",
     "funding",
     "conflicts_of_interest",
+    "median_os_pfs",
+    "grade_3_plus_ae",
+    "key_limitations",
 )
 
 
@@ -65,7 +68,9 @@ class EvidenceCardModel(BaseModel):
     funding: SourcedValue = Field(default_factory=SourcedValue)
     conflicts_of_interest: SourcedValue = Field(default_factory=SourcedValue)
     outcomes: List[OutcomeValue] = Field(default_factory=list)
-
+    median_os_pfs: SourcedValue = Field(default_factory=SourcedValue)
+    grade_3_plus_ae: SourcedValue = Field(default_factory=SourcedValue)
+    key_limitations: SourcedValue = Field(default_factory=SourcedValue)
 
 def _normalize_ws(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip().lower()

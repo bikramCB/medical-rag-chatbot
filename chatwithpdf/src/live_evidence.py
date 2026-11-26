@@ -155,7 +155,7 @@ def clinical_trial(nct_id: str) -> dict:
     measures = [item.get("measure") or "" for item in outcomes if item.get("measure")]
     updates = extract_protocol_updates(protocol)
     adverse_events = extract_adverse_events(payload.get("resultsSection") or {})
-    return {"nct_id": nct_id, "status": status, "registered_primary_outcomes": measures}
+    return {"nct_id": nct_id, "status": status, "registered_primary_outcomes": measures, "last_update_date": updates["last_update_date"], "adverse_events": adverse_events,"amendment_note": updates["amendment_note"]}
 
 
 def _tokens(text: str):
