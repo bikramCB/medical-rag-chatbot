@@ -1,6 +1,5 @@
 Production chunking strategy
 PaperChatBot, from PDF bytes to Weaviate
-This is the path a real upload uses. dump_chunks.py stops after step 8 and writes one JSON record per Docling element. Production continues through the 600-token merge and the embedding store.
 
 1. The API receives a PDF URL. PaperChatBot downloads the file with requests and keeps the bytes in memory.
 2. It hashes those bytes with SHA256. That hash is the Weaviate collection name. The same file is not parsed again when the collection already has objects.

@@ -9,7 +9,47 @@ from langchain.schema import Document
 from weaviate.classes.config import Configure, DataType, Property, VectorDistances
 from weaviate.classes.query import Filter, HybridFusion
 
+_MESH_CACHE: dict[str, list[str]] = {}
 
+
+def fetch_mesh_synonyms(term: str, max_terms: int = 4, timeout: float = 3.0) -> list[str]:
+    """Query NCBI E-utilities MeSH database with in-memory caching and safe fallback."""
+    cleaned = re.sub(r"\s+", " ", (term or "").strip()).lower()
+    if len(cleaned) < 3:
+        return []
+    if cleaned in _MESH_CACHE:
+        return _MESH_CACHE[cleaned][:max_terms]
+
+    synonyms: list[str] = []
+    try:
+        search_resp = requests.get(
+            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
+            params={"db": "mesh", "term": cleaned, "retmode": "json", "retmax": 3},
+            timeout=timeout,
+        )
+        search_resp.raise_for_status()
+        id_list = ((search_resp.json().get("esearchresult") or {}).get("idlist")) or []
+        if id_list:
+            sum_resp = requests.get(
+                "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi",
+                params={"db": "mesh", "id": ",".join(id_list[:3]), "retmode": "json"},
+                timeout=timeout,
+            )
+            sum_resp.raise_for_status()
+            result_map = sum_resp.json().get("result") or {}
+            for uid in id_list[:3]:
+                entry = result_map.get(str(uid)) or {}
+                heading = ((entry.get("ds_meshterms") or [None])[0] or "").strip()
+                if not heading:
+                    heading = (entry.get("title") or "").strip()
+                if heading and heading.lower() != cleaned and heading.lower() not in {s.lower() for s in synonyms}:
+                    synonyms.append(heading)
+    except Exception:
+        synonyms = []
+
+    _MESH_CACHE[cleaned] = synonyms
+    return synonyms[:max_terms]
+    
 class EmbeddingGenerationError(Exception):
     """Raised when one or more chunk embeddings cannot be generated."""
 

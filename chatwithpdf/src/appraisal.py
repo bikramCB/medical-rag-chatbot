@@ -135,6 +135,17 @@ def deterministic_red_flags(card: dict, documents) -> list:
             })
             break
 
+    if re.search(
+        r"\bsubgroup\b[^\n\.]{0,80}\b(?:underpowered|small sample|post[- ]hoc|exploratory|hypothesis[- ]generating)\b",
+        body,
+        re.I,
+    ):
+        flags.append({
+            "flag": "subgroup_limitation",
+            "detail": "The paper mentions subgroup findings that are described as exploratory, post-hoc, small, or underpowered.",
+            "endpoint": "",
+        })
+
     if study_type == "rct":
         if _OPEN_LABEL.search(body):
             flags.append({
