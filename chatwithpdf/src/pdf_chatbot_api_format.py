@@ -32,6 +32,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 for _env_path in (
+    Path(__file__).resolve().parents[1] / ".env",
     Path(__file__).resolve().parents[1] / "chatwithpdf" / ".env",
     Path(__file__).resolve().parent / ".env",
 ):
@@ -560,18 +561,78 @@ class PaperChatBot(WeaviateStoreMixin, ChunkingMixin):
         return rewrite_prompt | self.llm | StrOutputParser()
 
     def _expand_medical_query(self, standalone_question: str) -> str:
-        """Add known medical synonyms, then ask the chat model for any others."""
+        """Add known medical synonyms and cached MeSH terms, then ask the chat model for any others."""
         grounded = expand_known_medical_terms(standalone_question)
+        mesh_additions = []
+        seen = {token.lower() for token in grounded.split()}
+        for candidate in re.findall(r"[A-Za-z][A-Za-z0-9\-]{2,}", standalone_question or ""):
+            if candidate.lower() in {"what", "which", "where", "does", "with", "from", "this", "that", "paper", "study"}:
+                continue
+            for syn in fetch_mesh_synonyms(candidate, max_terms=2):
+                if syn.lower() not in seen:
+                    seen.add(syn.lower())
+                    mesh_additions.append(syn)
+            if len(mesh_additions) >= 6:
+                break
+
+        enriched = f"{grounded} {' '.join(mesh_additions)}".strip() if mesh_additions else grounded
         try:
-            prompt = get_prompt("expand", "template").format(query=grounded)
+            prompt = get_prompt("expand", "template").format(query=enriched)
             expanded = self.llm.invoke([HumanMessage(content=prompt)]).content.strip()
             expanded = expanded[:1000].strip()
             if expanded:
                 print(f"Expanded search query: {expanded}")
                 return expanded
         except Exception as e:
-            print(f"Query expansion failed, using the known synonyms: {e}")
-        return grounded
+            print(f"Query expansion failed, using the known/MeSH synonyms: {e}")
+        return enriched
+
+def apply_claim_guardrails(answer: str, quote_checks: list) -> str:
+    """Append explicit warnings when numeric claims lack chunk support or show statistical spin/disagreement."""
+    if not answer or not quote_checks:
+        return answer
+
+    warnings: list[str] = []
+    seen_notes: set[str] = set()
+
+    for check in quote_checks:
+        if not isinstance(check, dict):
+            continue
+        claim_label = (check.get("claim") or "").strip()[:120]
+
+        unsupported = check.get("unsupported_numbers") or []
+        if unsupported:
+            note = f"Unverified numbers in claim ({', '.join(str(x) for x in unsupported)}): \"{claim_label}\""
+            if note not in seen_notes:
+                seen_notes.add(note)
+                warnings.append(note)
+
+        for stat in check.get("statistics") or []:
+            if not isinstance(stat, dict):
+                continue
+            if stat.get("spin"):
+                note = (
+                    f"Statistical spin warning: interval [{stat.get('ci_low')}, {stat.get('ci_high')}] "
+                    f"crosses null for \"{claim_label}\" despite significance wording."
+                )
+                if note not in seen_notes:
+                    seen_notes.add(note)
+                    warnings.append(note)
+            elif stat.get("ci_p_disagree"):
+                note = (
+                    f"CI/p-value disagreement at alpha=0.05 for \"{claim_label}\" "
+                    f"(CI [{stat.get('ci_low')}, {stat.get('ci_high')}], p={stat.get('p_value')})."
+                )
+                if note not in seen_notes:
+                    seen_notes.add(note)
+                    warnings.append(note)
+
+    if not warnings:
+        return answer
+
+    bullet_lines = "\n".join(f"- {item}" for item in warnings)
+    return f"{answer.rstrip()}\n\n**Verification & Statistical Guardrail Notes:**\n{bullet_lines}"
+
 
     def _retrieve(self, standalone_question: str, top_k: int = 8):
         """Hybrid search for 40 candidates, then a cross-encoder keeps the top chunks."""
@@ -950,6 +1011,7 @@ class PaperChatBot(WeaviateStoreMixin, ChunkingMixin):
                 and chosen_tool not in {"reference_extractor", "title_generation", "description_generation"}
             ):
                 quote_checks = self._check_answer_quotes(answer, context_docs)
+                answer = apply_claim_guardrails(answer, quote_checks)
             final_answer, final_citation_list = apply_citations(answer, context_docs)
             if context_docs and len(context_docs) > 12:
                 cited = {f"CHUNK_{index}" for index in cited_chunk_indexes(answer, len(context_docs))}

@@ -146,6 +146,18 @@ def show_live(card: dict):
         for trial in trials:
             switch = trial.get("outcome_switch") or {}
             st.write(f"{trial.get('nct_id')}: {trial.get('status')}")
+            if trial.get("last_update_date"):
+                st.caption(f"Last updated on ClinicalTrials.gov: {trial['last_update_date']}")
+            if trial.get("amendment_note"):
+                st.caption(f"Protocol note: {trial['amendment_note']}")
+            ae = trial.get("adverse_events") or {}
+            if ae.get("posted"):
+                if ae.get("serious_summary"):
+                    st.write(f"Posted AEs — {ae['serious_summary']}")
+                if ae.get("top_events"):
+                    st.dataframe(ae["top_events"], use_container_width=True, hide_index=True)
+            else:
+                st.caption("No posted adverse event results on ClinicalTrials.gov yet.")
             if switch.get("flag"):
                 st.warning(switch.get("reason"))
     else:
@@ -197,6 +209,9 @@ def show_matrix(matrix: dict):
             "CI": first.get("ci"),
             "Crosses null": stats.get("crosses_null"),
             "Page": first.get("page"),
+            "Median OS/PFS": row.get("median_os_pfs"),
+            "Grade >=3 AEs": row.get("grade_3_plus_ae"),
+            "Key limitations": row.get("key_limitations"),
         })
     if rows:
         st.dataframe(rows, use_container_width=True, hide_index=True)
@@ -329,3 +344,97 @@ with chat_tab:
                 st.download_button("Download highlighted PDF", data=painted.content, file_name="highlighted.pdf", mime="application/pdf")
             except Exception as exc:
                 st.error(str(exc))
+
+
+def build_matrix_citation(row: dict, selection_key: str):
+    """Build a /highlight-compatible citation dict from a chosen matrix cell."""
+    if selection_key == "primary_outcome":
+        outcomes = row.get("primary_outcomes") or []
+        if not outcomes:
+            return None
+        first = outcomes[0]
+        page = first.get("page")
+        bbox = first.get("bbox")
+        chunk_idx = first.get("chunk_index")
+    else:
+        meta = (row.get("field_meta") or {}).get(selection_key) or {}
+        page = meta.get("page")
+        bbox = meta.get("bbox")
+        chunk_idx = meta.get("chunk_index")
+
+    if page is None or not isinstance(bbox, dict):
+        return None
+
+    normalized_bbox = {
+        "page": bbox.get("page", page),
+        "x0": bbox.get("x0"),
+        "y0": bbox.get("y0"),
+        "x1": bbox.get("x1"),
+        "y1": bbox.get("y1"),
+    }
+    if not all(isinstance(normalized_bbox[k], (int, float)) for k in ("x0", "y0", "x1", "y1")):
+        return None
+
+    chunk_label = f"CHUNK_{chunk_idx}" if isinstance(chunk_idx, int) else "CHUNK_0"
+    return {
+        "chunk": chunk_label,
+        "page_content": "",
+        "metadata": {
+            "source": row.get("source_pdf") or "",
+            "chunk_id": f"doc_{chunk_idx}" if isinstance(chunk_idx, int) else "unknown",
+            "page": page,
+            "section_category": "",
+            "bbox": normalized_bbox,
+        },
+    }
+
+
+def render_matrix_cell_highlighter(matrix_rows_list: list):
+    """Let the user pick a matrix paper + column and download a PDF with that box highlighted."""
+    if not matrix_rows_list:
+        return
+    st.markdown("**Highlight source location in PDF**")
+    paper_options = [r.get("source_pdf") or f"Paper {i + 1}" for i, r in enumerate(matrix_rows_list)]
+    selected_paper = st.selectbox("Paper", options=paper_options, key="matrix_hl_paper")
+    row = matrix_rows_list[paper_options.index(selected_paper)]
+
+    cell_options = [
+        "primary_outcome",
+        "median_os_pfs",
+        "grade_3_plus_ae",
+        "key_limitations",
+        "study_design",
+        "sample_size",
+        "intervention",
+        "comparator",
+    ]
+    selected_cell = st.selectbox("Column / field", options=cell_options, key="matrix_hl_field")
+    citation = build_matrix_citation(row, selected_cell)
+
+    if citation is None:
+        st.caption("No bounding-box coordinates were recorded for this cell.")
+        return
+
+    st.caption(f"Target: Page {citation['metadata']['page']} (`{citation['chunk']}`)")
+    if st.button("Prepare highlighted PDF for cell", key="matrix_hl_btn"):
+        try:
+            resp = requests.post(
+                f"{api_base()}/highlight",
+                json={"pdf_url": row.get("source_pdf"), "citations": [citation]},
+                timeout=120,
+            )
+            resp.raise_for_status()
+            st.session_state["matrix_highlighted_pdf"] = resp.content
+            st.session_state["matrix_highlighted_name"] = f"{Path(row.get('source_pdf') or 'paper').stem}_{selected_cell}_highlighted.pdf"
+        except Exception as exc:
+            st.error(str(exc))
+
+    if st.session_state.get("matrix_highlighted_pdf"):
+        st.download_button(
+            "Download cell-highlighted PDF",
+            data=st.session_state["matrix_highlighted_pdf"],
+            file_name=st.session_state.get("matrix_highlighted_name") or "highlighted.pdf",
+            mime="application/pdf",
+            key="matrix_hl_download",
+        )
+

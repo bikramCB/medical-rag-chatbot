@@ -75,6 +75,77 @@ def pubmed_retraction(doi: str) -> dict:
     count = int(((payload.get("esearchresult") or {}).get("count")) or 0)
     return {"doi": doi, "retracted_publication_count": count, "retracted": count > 0}
 
+def extract_protocol_updates(protocol: dict) -> dict:
+    """Extract last update date and any protocol/amendment notes from protocolSection."""
+    if not isinstance(protocol, dict):
+        return {"last_update_date": "", "amendment_note": ""}
+    status_mod = protocol.get("statusModule") or {}
+    update_struct = status_mod.get("lastUpdatePostDateStruct") or {}
+    last_update = (update_struct.get("date") or "").strip()
+
+    # ClinicalTrials.gov v2 may expose design/protocol or amendment-like strings depending on record.
+    design_mod = protocol.get("designModule") or {}
+    notes = []
+    if status_mod.get("expandedAccessInfo") and isinstance(status_mod["expandedAccessInfo"], dict):
+        avail = status_mod["expandedAccessInfo"].get("hasExpandedAccess")
+        if avail is not None:
+            notes.append(f"Expanded access: {avail}")
+    if design_mod.get("bioSpec") and isinstance(design_mod["bioSpec"], dict):
+        desc = (design_mod["bioSpec"].get("description") or "").strip()
+        if desc:
+            notes.append(desc[:160])
+
+    return {
+        "last_update_date": last_update,
+        "amendment_note": " | ".join(notes),
+    }
+
+
+def extract_adverse_events(results_section: dict) -> dict:
+    """Safely extract posted serious and other adverse events from ClinicalTrials.gov v2 resultsSection."""
+    if not isinstance(results_section, dict):
+        return {"posted": False, "serious_summary": "", "top_events": []}
+    ae_mod = results_section.get("adverseEventsModule")
+    if not isinstance(ae_mod, dict) or not ae_mod:
+        return {"posted": False, "serious_summary": "", "top_events": []}
+
+    serious_summary = ""
+    serious_groups = ae_mod.get("seriousEvents") or []
+    other_groups = ae_mod.get("otherEvents") or []
+    timeframe = (ae_mod.get("timeFrame") or "").strip()
+
+    parts = []
+    if timeframe:
+        parts.append(f"Timeframe: {timeframe}")
+    if serious_groups:
+        parts.append(f"Serious AE groups listed: {len(serious_groups)}")
+    if other_groups:
+        parts.append(f"Other AE groups listed: {len(other_groups)}")
+    serious_summary = "; ".join(parts)
+
+    top_events = []
+    for group in (serious_groups + other_groups)[:5]:
+        if not isinstance(group, dict):
+            continue
+        term = (group.get("term") or group.get("organSystem") or "").strip()
+        if not term:
+            continue
+        stats_list = group.get("stats") or []
+        affected_total = 0
+        for st_item in stats_list:
+            if isinstance(st_item, dict) and isinstance(st_item.get("numAffected"), int):
+                affected_total += st_item["numAffected"]
+        top_events.append({
+            "term": term,
+            "num_affected_total": affected_total,
+        })
+
+    return {
+        "posted": True,
+        "serious_summary": serious_summary,
+        "top_events": top_events,
+    }
+
 
 def clinical_trial(nct_id: str) -> dict:
     payload = _get_json(f"https://clinicaltrials.gov/api/v2/studies/{nct_id}")
@@ -82,6 +153,8 @@ def clinical_trial(nct_id: str) -> dict:
     status = ((protocol.get("statusModule") or {}).get("overallStatus")) or ""
     outcomes = ((protocol.get("outcomesModule") or {}).get("primaryOutcomes")) or []
     measures = [item.get("measure") or "" for item in outcomes if item.get("measure")]
+    updates = extract_protocol_updates(protocol)
+    adverse_events = extract_adverse_events(payload.get("resultsSection") or {})
     return {"nct_id": nct_id, "status": status, "registered_primary_outcomes": measures}
 
 
