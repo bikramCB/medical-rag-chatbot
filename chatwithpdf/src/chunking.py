@@ -437,7 +437,7 @@ class ChunkingMixin:
         def count_tokens(text: str) -> int:
             return estimate_tokens(text)
 
-        print(f"\n--- Starting new processing pipeline. ---")
+        print("\n--- Starting new processing pipeline. ---")
 
         # === CHANGED: Use the memory file we downloaded in __init__ ===
         if not self.pdf_file_bytes:
@@ -446,7 +446,7 @@ class ChunkingMixin:
 
         # Reset pointer to start of file
         self.pdf_file_bytes.seek(0)
-        
+
         # --- Step 1: Parse the PDF into raw elements (from memory) ---
         self.pdf_file_bytes.seek(0)
         pdf_payload = self.pdf_file_bytes.read()
@@ -456,10 +456,7 @@ class ChunkingMixin:
         if not raw_docs:
             print("No documents were loaded successfully. Exiting.")
             return
-        
-        # ... (The rest of your chunking logic remains EXACTLY the same from here down) ...
-        # ... (Copy the rest of your original method here: sorting, the process_text_buffer function, and the loop) ...
-        
+
         # Sort the documents by page number before processing
         raw_docs.sort(key=lambda x: x.metadata.get("page_number", 0))
 
@@ -468,7 +465,7 @@ class ChunkingMixin:
         text_buffer = ""
         CHUNK_TOKEN_LIMIT = 600
         TEXT_LIKE_ELEMENTS = ["NarrativeText", "Title", "Header"]
-                
+
         # NEW STATE VARIABLES for complex overlap rules
         current_page_number = raw_docs[0].metadata.get("page_number") if raw_docs else None
         last_metadata_for_page = None
@@ -476,16 +473,16 @@ class ChunkingMixin:
         global_last_text_overlap = ""
         # This stores the overlap for the NEXT chunk on the CURRENT page, used for INTRA-PAGE overlap
         intra_page_overlap = ""
-        
-        creation_timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        creation_timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         def process_text_buffer(buffer, metadata, initial_overlap):
             """
             Chunks a given text buffer, managing intra-chunk overlap.
             It returns the new chunks and the overlap from the VERY LAST chunk it created.
             """
-            nonlocal global_last_text_overlap # We need to modify the global text overlap from here
-            
+            nonlocal global_last_text_overlap
+
             new_chunks = []
             current_overlap = initial_overlap
             final_overlap_from_this_call = ""
@@ -495,8 +492,8 @@ class ChunkingMixin:
 
             def stamp_chunk(content, chunk_metadata):
                 enriched_metadata = chunk_metadata.copy()
-                enriched_metadata['creation_date_time'] = creation_timestamp
-                enriched_metadata['token_size'] = count_tokens(content)
+                enriched_metadata["creation_date_time"] = creation_timestamp
+                enriched_metadata["token_size"] = count_tokens(content)
                 summary = enriched_metadata.get("embed_text")
                 if isinstance(summary, str) and summary.strip():
                     enriched_metadata["embed_text"] = summary.strip() + "\n" + content[:400]
@@ -504,39 +501,38 @@ class ChunkingMixin:
 
             while count_tokens(buffer) > 0:
                 final_chunk_content = current_overlap + buffer
-                
+
                 # Check if the combined content fits in one chunk
                 if count_tokens(final_chunk_content) <= CHUNK_TOKEN_LIMIT:
                     stamp_chunk(final_chunk_content, metadata)
-                    
+
                     # This is a text chunk, so its overlap is eligible for all future overlaps
                     final_overlap_from_this_call = overlap_tail(buffer)
                     global_last_text_overlap = final_overlap_from_this_call
-                    buffer = "" # Done
+                    buffer = ""
                 else:
                     # Buffer is too large, must split
-                    # We subtract the overlap length to get a more accurate split point
                     estimated_split_char = (CHUNK_TOKEN_LIMIT - count_tokens(current_overlap)) * 4
                     split_index = -1
-                    for delimiter in ['.', '\n', ' ']:
-                        # Search backwards from the estimated split point
+                    for delimiter in [".", "\n", " "]:
                         found_index = buffer.rfind(delimiter, 0, estimated_split_char)
                         if found_index != -1:
                             split_index = found_index
                             break
-                    
-                    if split_index == -1: split_index = estimated_split_char
+
+                    if split_index == -1:
+                        split_index = estimated_split_char
 
                     text_for_this_chunk = buffer[:split_index + 1]
                     chunk_to_append_content = current_overlap + text_for_this_chunk
                     stamp_chunk(chunk_to_append_content, metadata)
-                    
+
                     # The overlap for the NEXT chunk is from the text we just added
                     current_overlap = overlap_tail(text_for_this_chunk)
                     final_overlap_from_this_call = current_overlap
                     global_last_text_overlap = final_overlap_from_this_call
-                    
-                    buffer = buffer[split_index + 1:] # Update buffer with the remainder
+
+                    buffer = buffer[split_index + 1:]
 
             return new_chunks, final_overlap_from_this_call
 
@@ -603,21 +599,30 @@ class ChunkingMixin:
             chunk_bbox = union_bbox(chunk_bbox, element.metadata)
 
             # === ELEMENT HANDLING LOGIC (MODIFIED) ===
-            # Always add element's text to the buffer.
             text_buffer += "\n\n" + element.page_content
-            # The metadata for the chunk will be based on the last element that contributed to it.
-            # We prioritize NarrativeText, Title, or Header for the metadata type.
             if last_metadata_for_page is None or element_type in TEXT_LIKE_ELEMENTS:
                 last_metadata_for_page = element.metadata
 
         # After the loop, process the very last buffer for the final page
         flush_text_buffer()
 
+        study_id = (getattr(self, "study_id", "") or "").strip()
+        raw_role = (getattr(self, "doc_role", "main") or "main").strip().lower()
+        doc_role = raw_role if raw_role in {"main", "supplement", "protocol"} else "main"
+
+        from biomedical_nern import stamp_biomedical_metadata
+
         for idx, doc in enumerate(final_chunks):
             doc.metadata["chunk_index"] = idx
+            if isinstance(doc.metadata, dict):
+                if study_id:
+                    doc.metadata["study_id"] = study_id
+                doc.metadata["doc_role"] = doc_role
+                stamp_biomedical_metadata(doc)
+
         self.all_documents = final_chunks
         print(f"Chunking complete. Original elements: {len(raw_docs)}, Final intelligent chunks: {len(self.all_documents)}")
-        
+
         self._index_chunks_in_weaviate()
         self.pdf_file_bytes = None
 

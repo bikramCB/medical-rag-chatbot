@@ -1,10 +1,14 @@
 from flask import Flask, Response, request, jsonify
-from pdf_chatbot_api_format import PaperChatBot, generate_details_for_chatbot, EmbeddingGenerationError
+from pdf_chatbot_api_format import PaperChatBot, generate_details_for_chatbot, EmbeddingGenerationError, get_prompt
 from highlight_pdf import paint_citation_boxes
 from matrix import build_matrix
+from pathlib import Path
+from stateless_synthesis import state_get, state_set, stateless_mode
 import os
 import logging
 import concurrent.futures
+import threading
+from contextlib import contextmanager
 import requests
 
 # Configure logging
@@ -25,47 +29,126 @@ def _startup_error(chatbot, pdf_url: str) -> str:
 def health():
     return jsonify({"status": "ok"})
 
-# This dictionary will cache chatbot instances based on the PDF URL.
-# This is a simple in-memory cache. For a production system, you might
-# want to use a more robust caching solution like Redis.
+# Process-local Weaviate clients, keyed by PDF. Chunk text is not the source of truth:
+# stateless mode drops it after each request and reloads it from Weaviate.
 chatbot_cache = {}
+_BOT_LOCKS = {}
+_BOT_LOCKS_GUARD = threading.Lock()
+
+
+def _lock_for(normalized_pdf_url: str):
+    with _BOT_LOCKS_GUARD:
+        lock = _BOT_LOCKS.get(normalized_pdf_url)
+        if lock is None:
+            lock = threading.Lock()
+            _BOT_LOCKS[normalized_pdf_url] = lock
+        return lock
+
+
+def _document_record(chatbot, pdf_url: str) -> dict:
+    from study_bundle import find_bundle_for_pdf
+    normalized = pdf_url.split("?")[0]
+    bundle = find_bundle_for_pdf(normalized) or find_bundle_for_pdf(pdf_url) or {}
+    study_id = (bundle.get("study_id") or getattr(chatbot, "study_id", "") or "").strip()
+    if study_id:
+        chatbot.study_id = study_id
+    return {
+        "pdf_url": normalized,
+        "doc_id": getattr(chatbot, "rag_index_name", "") or "",
+        "study_id": study_id,
+        "chunk_count": len(getattr(chatbot, "all_documents", []) or []),
+    }
+
+
+def _remember_document(chatbot, pdf_url: str) -> dict:
+    record = _document_record(chatbot, pdf_url)
+    state_set("documents", record["doc_id"] or record["pdf_url"], record)
+    state_set("documents_by_url", record["pdf_url"], record)
+    return record
+
+
+def _load_bot(pdf_url: str, force: bool = False):
+    """Open the PDF's Weaviate client. Identity comes from the request and the shared store."""
+    normalized = pdf_url.split("?")[0]
+    known = state_get("documents_by_url", normalized)
+    if known:
+        logger.info("Resolved doc_id=%s study_id=%s", known.get("doc_id"), known.get("study_id"))
+    chatbot = None if force else chatbot_cache.get(normalized)
+    if chatbot is None:
+        logger.info("Creating chatbot for %s", pdf_url)
+        chatbot = PaperChatBot(pdf_url=pdf_url)
+        if not chatbot.all_documents:
+            raise RuntimeError(_startup_error(chatbot, pdf_url))
+        chatbot_cache[normalized] = chatbot
+    elif not chatbot.all_documents:
+        logger.info("Reloading chunks for %s from Weaviate", pdf_url)
+        chatbot._load_data_from_weaviate()
+        if not chatbot.all_documents:
+            raise RuntimeError(_startup_error(chatbot, pdf_url))
+    record = _remember_document(chatbot, normalized)
+    return chatbot, list(chatbot.all_documents), record
+
+
+@contextmanager
+def _document_bot(pdf_url: str, force: bool = False):
+    normalized = pdf_url.split("?")[0]
+    lock = _lock_for(normalized)
+    lock.acquire()
+    chatbot = None
+    try:
+        chatbot, docs, record = _load_bot(pdf_url, force=force)
+        yield chatbot, docs, record
+    finally:
+        if chatbot is not None and stateless_mode():
+            chatbot.release_loaded_text()
+        lock.release()
+
+
+def _session_history(pdf_url: str, session_id: str, request_history) -> list:
+    if request_history:
+        return list(request_history)
+    if not session_id:
+        return []
+    saved = state_get("sessions", session_id) or state_get("sessions", pdf_url.split("?")[0])
+    history = (saved or {}).get("history") or []
+    return history if isinstance(history, list) else []
+
+
+def _store_session(pdf_url: str, session_id: str, record: dict, history: list, query: str, answer: str):
+    updated = list(history) + [{"human": query, "ai": answer}]
+    payload = {
+        "pdf_url": pdf_url.split("?")[0],
+        "doc_id": record.get("doc_id") or "",
+        "study_id": record.get("study_id") or "",
+        "history": updated[-20:],
+    }
+    state_set("sessions", session_id or payload["pdf_url"], payload)
+
 
 @app.route('/chat', methods=['POST'])
 def chat_endpoint():
     """
     Flask endpoint to interact with the PaperChatBot.
     Expects a JSON payload with 'pdf_url' and 'query'.
-    'history' is optional.
+    'history' and 'session_id' are optional.
     """
     data = request.get_json()
 
     pdf_url = data.get('pdf_url')
     query = data.get('query')
-    history = data.get('history', [])  # history is optional
+    session_id = (data.get("session_id") or "").strip()
+    request_history = data.get('history') or []
 
     if not pdf_url or not query:
         return jsonify({"error": "Missing 'pdf_url' or 'query' in request body"}), 400
 
     try:
-        # Normalize the URL by removing query parameters to use as a stable cache key
-        normalized_pdf_url = pdf_url.split('?')[0]
-        
-        # Check if a chatbot for this PDF URL is already in our cache
-        if normalized_pdf_url in chatbot_cache:
-            logger.info(f"Using cached chatbot for {pdf_url}")
-            chatbot = chatbot_cache[normalized_pdf_url]
-        else:
-            logger.info(f"Creating new chatbot for {pdf_url}")
-            # This might take some time as it downloads and processes the PDF
-            chatbot = PaperChatBot(pdf_url=pdf_url)
-            if not chatbot.all_documents:
-                message = _startup_error(chatbot, pdf_url)
-                logger.error(message)
-                return jsonify({"error": message}), 500
-            chatbot_cache[normalized_pdf_url] = chatbot
-            logger.info(f"Successfully created and cached chatbot for {pdf_url}")
-
-        result = chatbot.chat(query, history)
+        with _document_bot(pdf_url) as (chatbot, _docs, record):
+            history = _session_history(pdf_url, session_id, request_history)
+            result = chatbot.chat(query, history)
+            _store_session(pdf_url, session_id, record, history, query, result.get("answer") or "")
+            result["doc_id"] = record.get("doc_id") or ""
+            result["study_id"] = record.get("study_id") or ""
         return jsonify(result)
     
     except EmbeddingGenerationError as e:
@@ -114,18 +197,11 @@ def scorecard_endpoint():
         return jsonify({"error": "Missing 'pdf_url' in request body"}), 400
 
     try:
-        normalized_pdf_url = pdf_url.split('?')[0]
-        if normalized_pdf_url in chatbot_cache:
-            logger.info(f"Using cached chatbot for scorecard {pdf_url}")
-            chatbot = chatbot_cache[normalized_pdf_url]
-        else:
-            logger.info(f"Creating chatbot for scorecard {pdf_url}")
-            chatbot = PaperChatBot(pdf_url=pdf_url)
-            if not chatbot.all_documents:
-                return jsonify({"error": _startup_error(chatbot, pdf_url)}), 500
-            chatbot_cache[normalized_pdf_url] = chatbot
-
-        card = chatbot.get_evidence_card(force=bool(data.get("force")))
+        with _document_bot(pdf_url) as (chatbot, _docs, record):
+            card = chatbot.get_evidence_card(force=bool(data.get("force")))
+            card["doc_id"] = record.get("doc_id") or ""
+            if record.get("study_id"):
+                card["study_id"] = record["study_id"]
         return jsonify(card)
     except EmbeddingGenerationError:
         return jsonify({"error": "We apologize, but we were unable to process your document at this time. This may be due to a temporary issue. Please try uploading the document again."}), 503
@@ -134,15 +210,9 @@ def scorecard_endpoint():
         return jsonify({"error": str(e)}), 500
 
 
-def _chatbot_for(pdf_url: str):
-    normalized_pdf_url = pdf_url.split('?')[0]
-    if normalized_pdf_url in chatbot_cache:
-        return chatbot_cache[normalized_pdf_url]
-    chatbot = PaperChatBot(pdf_url=pdf_url)
-    if not chatbot.all_documents:
-        raise RuntimeError(_startup_error(chatbot, pdf_url))
-    chatbot_cache[normalized_pdf_url] = chatbot
-    return chatbot
+def _get_or_build_bot(pdf_url: str, force: bool = False):
+    chatbot, docs, _record = _load_bot(pdf_url, force=force)
+    return chatbot, docs
 
 
 @app.route('/matrix', methods=['POST'])
@@ -158,7 +228,8 @@ def matrix_endpoint():
         if not pdf_url or not str(pdf_url).strip():
             continue
         try:
-            cards.append(_chatbot_for(pdf_url).get_evidence_card(force=bool(data.get("force"))))
+            with _document_bot(pdf_url) as (chatbot, _docs, _record):
+                cards.append(chatbot.get_evidence_card(force=bool(data.get("force"))))
         except Exception as exc:
             logger.exception(f"Matrix skipped {pdf_url}")
             errors.append({"source_pdf": pdf_url, "error": str(exc)})
@@ -179,21 +250,8 @@ def batch_generate_details_endpoint():
     if not pdf_urls or not isinstance(pdf_urls, list):
         return jsonify({"error": "Missing 'pdf_urls' list in request body"}), 400
 
-    # Define the tasks for title and description generation
-    title_task = """Generate a formal, concise title for this document.
-    Rules:
-    Maximum 12 words.
-    Academic and professional tone.
-    Output only the title text.
-    Do not include explanations, markdown symbols (##), or references to chunks."""
-
-    description_task = """Generate a concise description for this document.
-    Rules:
-    2 to 4 sentences (maximum 80 words).
-    Academic and professional tone.
-    Output only the description text.
-    Do not include headings, markdown symbols (##), or references to chunks.
-    Do not explain how the description was formed."""
+    title_task = get_prompt("title", "instructions")
+    description_task = get_prompt("description", "instructions")
 
     all_generated_info = []
     
@@ -233,6 +291,76 @@ def batch_generate_details_endpoint():
                 all_generated_info.append({"source_pdf": chatbot_instance.pdf_url, "error": str(exc)})
     
     return jsonify(all_generated_info)
+
+
+from study_bundle import compute_study_id, save_study_bundle, tag_documents_for_study
+
+
+@app.post("/bundle")
+def build_study_bundle():
+    data = request.get_json(silent=True) or {}
+    main_pdf = (data.get("main_pdf") or "").strip()
+    supplement_pdfs = [p.strip() for p in (data.get("supplement_pdfs") or []) if isinstance(p, str) and p.strip()]
+    protocol_pdfs = [p.strip() for p in (data.get("protocol_pdfs") or []) if isinstance(p, str) and p.strip()]
+    force = bool(data.get("force", False))
+
+    if not main_pdf:
+        return jsonify({"error": "main_pdf is required"}), 400
+
+    members = [{"doc_role": "main", "pdf_url": main_pdf}]
+    members.extend({"doc_role": "supplement", "pdf_url": p} for p in supplement_pdfs)
+    members.extend({"doc_role": "protocol", "pdf_url": p} for p in protocol_pdfs)
+
+    study_id = compute_study_id(members)
+    indexed_files = []
+
+    for entry in members:
+        role = entry["doc_role"]
+        pdf_path = entry["pdf_url"]
+        with _document_bot(pdf_path, force=force) as (bot, docs, _record):
+            tag_documents_for_study(docs, study_id=study_id, doc_role=role, source_label=Path(pdf_path).name)
+            bot.study_id = study_id
+            bot.doc_role = role
+            if hasattr(bot, "_cached_study_bundle"):
+                del bot._cached_study_bundle
+            tagged = bot.persist_study_tags(docs)
+            if docs and tagged == 0:
+                raise RuntimeError(
+                    f"Study tags were not saved for {pdf_path}. Supplement search would miss this file."
+                )
+        indexed_files.append({
+            "doc_role": role,
+            "pdf_url": pdf_path,
+            "chunk_count": len(docs or []),
+            "tagged_chunks": tagged,
+        })
+
+    with _document_bot(main_pdf, force=force) as (main_bot, _main_docs, _record):
+        main_bot.study_id = study_id
+        if hasattr(main_bot, "_cached_study_bundle"):
+            del main_bot._cached_study_bundle
+        card = main_bot.get_evidence_card(force=force)
+    card["study_id"] = study_id
+    state_set("studies", study_id, {
+        "study_id": study_id,
+        "main_pdf": main_pdf,
+        "doc_id": card.get("content_hash") or card.get("doc_id") or "",
+        "members": indexed_files,
+    })
+
+    bundle = save_study_bundle({
+        "study_id": study_id,
+        "main_pdf": main_pdf,
+        "supplement_pdfs": supplement_pdfs,
+        "protocol_pdfs": protocol_pdfs,
+        "members": indexed_files,
+    })
+
+    return jsonify({
+        "study_id": study_id,
+        "bundle": bundle,
+        "evidence_card": card,
+    })
 
 
 if __name__ == '__main__':

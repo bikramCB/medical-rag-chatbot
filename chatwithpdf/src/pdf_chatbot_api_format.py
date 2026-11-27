@@ -5,6 +5,7 @@ weaviate_store.py stores and searches chunks. chunking.py builds them.
 """
 import atexit
 import concurrent.futures
+import gc
 import hashlib
 import io
 import json
@@ -42,8 +43,14 @@ load_dotenv()
 
 from chunking import ChunkingMixin
 from evidence import extract_evidence_card, load_cached_card, save_card
+from multi_hop import merge_unique_documents
 from stats_audit import audit_claim
-from weaviate_store import EmbeddingGenerationError, WeaviateStoreMixin, rerank_documents
+from weaviate_store import (
+    EmbeddingGenerationError,
+    WeaviateStoreMixin,
+    fetch_mesh_synonyms,
+    rerank_documents,
+)
 
 
 def vertex_chat_model():
@@ -338,6 +345,91 @@ def expand_known_medical_terms(question: str) -> str:
     return f"{question.strip()} {' '.join(additions)}"
 
 
+def _expand_query_with_biomedical_nern(
+    query: str,
+    max_extra_terms: int = 6,
+    source_text: str | None = None,
+) -> str:
+    """Append canonical drug, gene, and disease aliases without dropping the query text.
+
+    Entities are detected in source_text when given, so a later rewrite of the
+    search string cannot hide a code such as AZD9291 before alias lookup.
+    """
+    cleaned = re.sub(r"\s+", " ", (query or "").strip())
+    if not cleaned:
+        return cleaned
+    detect_in = source_text if source_text is not None else cleaned
+    try:
+        from biomedical_nern import normalize_biomedical_text
+        info = normalize_biomedical_text(detect_in, max_extra_terms=max_extra_terms)
+    except Exception as exc:
+        print(f"WARNING: NERN query expansion skipped ({exc}).")
+        return cleaned
+
+    extras = []
+    lowered = cleaned.lower()
+    for term in info.get("expansion_terms") or []:
+        alias = str(term).strip()
+        low = alias.lower()
+        if not low or low in lowered:
+            continue
+        extras.append(alias)
+        lowered = f"{lowered} {low}"
+        if len(extras) >= max_extra_terms:
+            break
+    if not extras:
+        return cleaned
+    print(f"NERN query aliases: {extras}")
+    return f"{cleaned} {' '.join(extras)}"
+
+
+def apply_claim_guardrails(answer: str, quote_checks: list) -> str:
+    """Append explicit warnings when numeric claims lack chunk support or show statistical spin/disagreement."""
+    if not answer or not quote_checks:
+        return answer
+
+    warnings: list[str] = []
+    seen_notes: set[str] = set()
+
+    for check in quote_checks:
+        if not isinstance(check, dict):
+            continue
+        claim_label = (check.get("claim") or "").strip()[:120]
+
+        unsupported = check.get("unsupported_numbers") or []
+        if unsupported:
+            note = f"Unverified numbers in claim ({', '.join(str(x) for x in unsupported)}): \"{claim_label}\""
+            if note not in seen_notes:
+                seen_notes.add(note)
+                warnings.append(note)
+
+        for stat in check.get("statistics") or []:
+            if not isinstance(stat, dict):
+                continue
+            if stat.get("spin"):
+                note = (
+                    f"Statistical spin warning: interval [{stat.get('ci_low')}, {stat.get('ci_high')}] "
+                    f"crosses null for \"{claim_label}\" despite significance wording."
+                )
+                if note not in seen_notes:
+                    seen_notes.add(note)
+                    warnings.append(note)
+            elif stat.get("ci_p_disagree"):
+                note = (
+                    f"CI/p-value disagreement at alpha=0.05 for \"{claim_label}\" "
+                    f"(CI [{stat.get('ci_low')}, {stat.get('ci_high')}], p={stat.get('p_value')})."
+                )
+                if note not in seen_notes:
+                    seen_notes.add(note)
+                    warnings.append(note)
+
+    if not warnings:
+        return answer
+
+    bullet_lines = "\n".join(f"- {item}" for item in warnings)
+    return f"{answer.rstrip()}\n\n**Verification & Statistical Guardrail Notes:**\n{bullet_lines}"
+
+
 class PaperChatBot(WeaviateStoreMixin, ChunkingMixin):
     _EMBED_BATCH_SIZE = 100
     _VALID_TOOLS = set(QueryRouter.model_fields["tool_name"].annotation.__args__)
@@ -402,8 +494,12 @@ class PaperChatBot(WeaviateStoreMixin, ChunkingMixin):
         self.rewrite_chain = self._create_rewrite_chain()
         self.last_interaction_time = time.time()
         self.inactivity_limit = 3600
-        monitor_thread = threading.Thread(target=self._monitor_inactivity, daemon=True)
-        monitor_thread.start()
+        from stateless_synthesis import stateless_mode
+        if stateless_mode():
+            print("INFO: STATELESS_MODE is on. This document will not start an inactivity thread.")
+        else:
+            monitor_thread = threading.Thread(target=self._monitor_inactivity, daemon=True)
+            monitor_thread.start()
 
         print("Attempting to connect to Weaviate...")
         http_host = os.getenv("WEAVIATE_HOST", "localhost").strip().strip('"')
@@ -582,63 +678,142 @@ class PaperChatBot(WeaviateStoreMixin, ChunkingMixin):
             expanded = expanded[:1000].strip()
             if expanded:
                 print(f"Expanded search query: {expanded}")
-                return expanded
+                return _expand_query_with_biomedical_nern(
+                    expanded,
+                    max_extra_terms=6,
+                    source_text=standalone_question,
+                )
         except Exception as e:
             print(f"Query expansion failed, using the known/MeSH synonyms: {e}")
-        return enriched
+        return _expand_query_with_biomedical_nern(
+            enriched,
+            max_extra_terms=6,
+            source_text=standalone_question,
+        )
 
-def apply_claim_guardrails(answer: str, quote_checks: list) -> str:
-    """Append explicit warnings when numeric claims lack chunk support or show statistical spin/disagreement."""
-    if not answer or not quote_checks:
-        return answer
+    def _study_bundle(self) -> dict:
+        """Saved bundle for this PDF, if the user attached supplements or a protocol."""
+        cached = getattr(self, "_cached_study_bundle", None)
+        if isinstance(cached, dict) and cached.get("study_id"):
+            return cached
+        bundle = {}
+        try:
+            from study_bundle import find_bundle_for_pdf
+            bundle = find_bundle_for_pdf(getattr(self, "pdf_url", "")) or find_bundle_for_pdf(
+                getattr(self, "normalized_pdf_url", "")
+            ) or {}
+        except Exception as exc:
+            print(f"WARNING: Study bundle lookup skipped ({exc}).")
+        if bundle.get("study_id"):
+            self._cached_study_bundle = bundle
+            if not getattr(self, "study_id", ""):
+                self.study_id = bundle["study_id"]
+        return bundle
 
-    warnings: list[str] = []
-    seen_notes: set[str] = set()
+    def _weaviate_class_for_pdf(self, pdf_path: str) -> str:
+        """Class name of a companion PDF. Each file is indexed in its own collection."""
+        cache = getattr(self, "_pdf_class_cache", None)
+        if cache is None:
+            cache = {}
+            self._pdf_class_cache = cache
+        key = os.path.normcase(os.path.abspath(pdf_path))
+        if key in cache:
+            return cache[key]
+        with open(pdf_path, "rb") as handle:
+            digest = hashlib.sha256(handle.read()).hexdigest()
+        saved_name = self.rag_index_name
+        self.rag_index_name = digest
+        try:
+            class_name = self._get_weaviate_class_name()
+        finally:
+            self.rag_index_name = saved_name
+        cache[key] = class_name
+        return class_name
 
-    for check in quote_checks:
-        if not isinstance(check, dict):
-            continue
-        claim_label = (check.get("claim") or "").strip()[:120]
+    def _retrieve_with_multi_hop(self, search_query: str, raw_query: str = "", k: int = 20, max_hops: int = 2):
+        """First hybrid search, then at most a few follow-up searches for missing tables or supplements."""
+        effective_raw = (raw_query or search_query or "").strip()
+        bundle = self._study_bundle()
+        study_id = (getattr(self, "study_id", "") or bundle.get("study_id") or "").strip()
 
-        unsupported = check.get("unsupported_numbers") or []
-        if unsupported:
-            note = f"Unverified numbers in claim ({', '.join(str(x) for x in unsupported)}): \"{claim_label}\""
-            if note not in seen_notes:
-                seen_notes.add(note)
-                warnings.append(note)
+        # The current collection is already this PDF. A study_id filter would drop chunks
+        # indexed before the bundle tag was written.
+        docs = self._perform_hybrid_search(
+            search_query,
+            k=k,
+            exclude_references=True,
+        )
 
-        for stat in check.get("statistics") or []:
-            if not isinstance(stat, dict):
-                continue
-            if stat.get("spin"):
-                note = (
-                    f"Statistical spin warning: interval [{stat.get('ci_low')}, {stat.get('ci_high')}] "
-                    f"crosses null for \"{claim_label}\" despite significance wording."
+        try:
+            from study_bundle import query_needs_supplement
+            if study_id and query_needs_supplement(effective_raw, docs):
+                supp_docs = self._perform_hybrid_search(
+                    search_query,
+                    k=max(6, k // 2),
+                    exclude_references=True,
+                    study_id=study_id,
+                    doc_roles=["supplement", "protocol"],
                 )
-                if note not in seen_notes:
-                    seen_notes.add(note)
-                    warnings.append(note)
-            elif stat.get("ci_p_disagree"):
-                note = (
-                    f"CI/p-value disagreement at alpha=0.05 for \"{claim_label}\" "
-                    f"(CI [{stat.get('ci_low')}, {stat.get('ci_high')}], p={stat.get('p_value')})."
-                )
-                if note not in seen_notes:
-                    seen_notes.add(note)
-                    warnings.append(note)
+                docs = merge_unique_documents(docs, supp_docs, max_total=k + 8)
+                for member in bundle.get("members") or []:
+                    role = (member.get("doc_role") or "").strip().lower()
+                    pdf_path = (member.get("pdf_url") or "").strip()
+                    if role not in {"supplement", "protocol"} or not pdf_path or not os.path.isfile(pdf_path):
+                        continue
+                    if os.path.normcase(os.path.abspath(pdf_path)) == os.path.normcase(os.path.abspath(self.pdf_url)):
+                        continue
+                    extra = self._perform_hybrid_search(
+                        search_query,
+                        k=max(6, k // 2),
+                        exclude_references=True,
+                        collection_name=self._weaviate_class_for_pdf(pdf_path),
+                    )
+                    for doc in extra:
+                        doc.metadata["doc_role"] = role
+                        doc.metadata["study_id"] = study_id
+                    docs = merge_unique_documents(docs, extra, max_total=k + 8)
+        except Exception as exc:
+            print(f"WARNING: Supplement hop skipped ({exc}).")
 
-    if not warnings:
-        return answer
+        hops_used = 0
+        try:
+            from multi_hop import plan_followup_queries
+            while hops_used < max_hops:
+                followup_queries = plan_followup_queries(effective_raw, docs, max_queries=2)
+                if not followup_queries:
+                    break
+                print(f"Multi-hop {hops_used + 1}: {followup_queries}")
+                added_any = False
+                for followup in followup_queries:
+                    extra = self._perform_hybrid_search(
+                        followup,
+                        k=max(6, k // 2),
+                        exclude_references=True,
+                    )
+                    before_len = len(docs)
+                    docs = merge_unique_documents(docs, extra, max_total=k + 12)
+                    if len(docs) > before_len:
+                        added_any = True
+                hops_used += 1
+                if not added_any:
+                    break
+        except Exception as exc:
+            print(f"WARNING: Multi-hop retrieval skipped ({exc}).")
 
-    bullet_lines = "\n".join(f"- {item}" for item in warnings)
-    return f"{answer.rstrip()}\n\n**Verification & Statistical Guardrail Notes:**\n{bullet_lines}"
-
+        print(f"Multi-hop retrieval returned {len(docs)} chunks after {hops_used} follow-up hop(s).")
+        return docs
 
     def _retrieve(self, standalone_question: str, top_k: int = 8):
-        """Hybrid search for 40 candidates, then a cross-encoder keeps the top chunks."""
+        """Hybrid search, bounded follow-up hops, then a cross-encoder keeps the top chunks."""
         candidate_k = int(os.getenv("RETRIEVAL_CANDIDATES", "40"))
+        max_hops = int(os.getenv("RETRIEVAL_MAX_HOPS", "2"))
         expanded = self._expand_medical_query(standalone_question)
-        docs = self._perform_hybrid_search(expanded, k=candidate_k)
+        docs = self._retrieve_with_multi_hop(
+            search_query=expanded,
+            raw_query=standalone_question,
+            k=candidate_k,
+            max_hops=max_hops,
+        )
         kept = rerank_documents(standalone_question, docs, top_n=top_k, device=self.device)
         print(f"Two-stage retrieval kept {len(kept)} of {len(docs)} candidates.")
         return kept
@@ -686,18 +861,65 @@ def apply_claim_guardrails(answer: str, quote_checks: list) -> str:
             print(f"Quote check failed: {e}")
             return []
 
+    def release_loaded_text(self):
+        """Drop the in-memory chunk list. The next request reloads it from Weaviate."""
+        self.all_documents = []
+        self.pdf_file_bytes = None
+        gc.collect()
+
+    def _summarize_long_doc_with_hierarchy(self, documents, instruction: str, direct_char_threshold: int = 14000) -> str:
+        """Summarize short inputs in one call and long inputs by section, then synthesize."""
+        def _call_llm(prompt: str) -> str:
+            response = self.llm.invoke([HumanMessage(content=prompt)])
+            return getattr(response, "content", str(response)) or ""
+
+        try:
+            from stateless_synthesis import hierarchical_summarize_documents
+            result = hierarchical_summarize_documents(
+                documents=documents,
+                llm_call=_call_llm,
+                focus_instruction=instruction,
+                direct_char_threshold=direct_char_threshold,
+            )
+            if result:
+                return result
+        except Exception as exc:
+            print(f"WARNING: Hierarchical summarization fallback ({exc}).")
+
+        fallback_text = "\n\n".join(
+            (getattr(doc, "page_content", "") or "").strip() for doc in (documents or [])
+        )[:direct_char_threshold]
+        return _call_llm(f"{instruction}\n\n{fallback_text}")
+
+    def _document_text_for_prompt(self, documents, instruction: str, direct_char_threshold: int = 14000) -> str:
+        """Keep a short paper intact. Condense a guideline, CSR, or briefing before the final prompt."""
+        docs = list(documents or [])
+        size = sum(len(getattr(doc, "page_content", "") or "") for doc in docs)
+        if size <= direct_char_threshold:
+            return "\n\n".join((getattr(doc, "page_content", "") or "").strip() for doc in docs)
+        print(f"Long document ({size} characters). Summarizing by section before the final prompt.")
+        return self._summarize_long_doc_with_hierarchy(
+            docs,
+            instruction=instruction,
+            direct_char_threshold=direct_char_threshold,
+        )
+
     def generate_from_all_chunks(self, task_description: str):
-        """Generate text from the full paper, skipping retrieval."""
+        """Generate text from the paper. Long documents are summarized section by section first."""
         if not self.all_documents:
             return {"answer": "No documents available to process.", "citations": []}
-        full_context = "\n\n".join(doc.page_content for doc in self.all_documents)
-        sys_msg = get_prompt("full_text", "system").format(
-            task_description=task_description,
-            full_context=full_context,
-        )
+        source_docs = body_documents(self.all_documents)
         try:
-            response = self.llm.invoke([SystemMessage(content=sys_msg)])
-            return {"answer": response.content.strip(), "citations": []}
+            answer = self._document_text_for_prompt(source_docs, task_description)
+            size = sum(len(getattr(doc, "page_content", "") or "") for doc in source_docs)
+            if size <= 14000:
+                sys_msg = get_prompt("full_text", "system").format(
+                    task_description=task_description,
+                    full_context=answer,
+                )
+                response = self.llm.invoke([SystemMessage(content=sys_msg)])
+                answer = response.content.strip()
+            return {"answer": answer.strip(), "citations": []}
         except Exception as e:
             print(f"An error occurred during LLM invocation for full-text generation: {e}")
             return {"answer": f"An internal error occurred: {e}.", "citations": []}
@@ -706,15 +928,24 @@ def apply_claim_guardrails(answer: str, quote_checks: list) -> str:
         answer = "Could not generate an answer based on the provided document."
         context_docs = body_documents(self.all_documents)
         print("Executing: Full Document Summarization")
-        summary_prompt = PromptTemplate.from_template(get_prompt("summary", "template"))
-        summary_chain = summary_prompt | self.llm | StrOutputParser()
-        answer = summary_chain.invoke({"pubtext": format_labeled_chunks(context_docs)})
+        summary_instruction = get_prompt("summary", "template").format(
+            pubtext="Use the labeled source chunks. End every bullet with its [CHUNK_N] tag."
+        )
+        if sum(len(doc.page_content or "") for doc in context_docs) <= 14000:
+            summary_prompt = PromptTemplate.from_template(get_prompt("summary", "template"))
+            summary_chain = summary_prompt | self.llm | StrOutputParser()
+            answer = summary_chain.invoke({"pubtext": format_labeled_chunks(context_docs)})
+        else:
+            answer = self._summarize_long_doc_with_hierarchy(context_docs, summary_instruction)
         return answer, context_docs
 
     def _answer_title(self, query, formatted_history):
         answer = "Could not generate an answer based on the provided document."
         print("Executing: Title Generation")
-        full_document_text = "\n\n".join(doc.page_content for doc in self.all_documents)
+        full_document_text = self._document_text_for_prompt(
+            self.all_documents,
+            "List the document title, study name, design, population, intervention, and primary endpoint. Stay under 400 words and do not invent facts.",
+        )
         title_prompt = PromptTemplate.from_template(get_prompt("title", "template"))
         title_chain = title_prompt | self.llm | StrOutputParser()
         answer = title_chain.invoke({
@@ -726,7 +957,10 @@ def apply_claim_guardrails(answer: str, quote_checks: list) -> str:
     def _answer_description(self, query, formatted_history):
         answer = "Could not generate an answer based on the provided document."
         print("Executing: Description Generation")
-        full_document_text = "\n\n".join(doc.page_content for doc in self.all_documents)
+        full_document_text = self._document_text_for_prompt(
+            self.all_documents,
+            "List the study question, population, intervention, main numerical results, and limitation. Stay under 500 words and do not invent facts.",
+        )
         description_prompt = PromptTemplate.from_template(get_prompt("description", "template"))
         description_chain = description_prompt | self.llm | StrOutputParser()
         answer = description_chain.invoke({
@@ -893,23 +1127,35 @@ def apply_claim_guardrails(answer: str, quote_checks: list) -> str:
         else:
             print("Step 2: No explicit section header found. Falling back to comprehensive analysis of the full document.")
             context_docs = body_documents(self.all_documents)
-            sys_msg = get_prompt("key_findings", "fallback").format(
-                context_for_llm=format_labeled_chunks(context_docs)
+            findings_instruction = get_prompt("key_findings", "fallback").format(
+                context_for_llm="Use the labeled source chunks. Keep each [CHUNK_N] tag."
             )
-            response = self.llm.invoke([
-                SystemMessage(content=sys_msg),
-                HumanMessage(content="Generate a comprehensive summary of the key findings from the entire document."),
-            ])
-            answer = response.content
+            if sum(len(doc.page_content or "") for doc in context_docs) <= 14000:
+                sys_msg = get_prompt("key_findings", "fallback").format(
+                    context_for_llm=format_labeled_chunks(context_docs)
+                )
+                response = self.llm.invoke([
+                    SystemMessage(content=sys_msg),
+                    HumanMessage(content="Generate a comprehensive summary of the key findings from the entire document."),
+                ])
+                answer = response.content
+            else:
+                answer = self._summarize_long_doc_with_hierarchy(context_docs, findings_instruction)
         return answer, context_docs
 
     def _answer_methodology(self, query, formatted_history):
         answer = "Could not generate an answer based on the provided document."
         print("Executing: Methodology Summary Extraction from Full Document")
         context_docs = body_documents(self.all_documents)
-        methodology_prompt = PromptTemplate.from_template(get_prompt("methodology", "template"))
-        methodology_chain = methodology_prompt | self.llm | StrOutputParser()
-        answer = methodology_chain.invoke({"pubtext": format_labeled_chunks(context_docs)})
+        method_instruction = get_prompt("methodology", "template").format(
+            pubtext="Use the labeled source chunks. End every bullet with its [CHUNK_N] tag."
+        )
+        if sum(len(doc.page_content or "") for doc in context_docs) <= 14000:
+            methodology_prompt = PromptTemplate.from_template(get_prompt("methodology", "template"))
+            methodology_chain = methodology_prompt | self.llm | StrOutputParser()
+            answer = methodology_chain.invoke({"pubtext": format_labeled_chunks(context_docs)})
+        else:
+            answer = self._summarize_long_doc_with_hierarchy(context_docs, method_instruction)
         return answer, context_docs
 
     def _answer_from_retrieval(self, query, formatted_history, prompt_section, prompt_key, human_message, extra_fields=None):
@@ -1086,8 +1332,8 @@ def main():
             )
             if is_generate_details_command or is_combined_query:
                 print("\n--- Answer ---")
-                title_task = get_prompt("title", "cli_task")
-                description_task = get_prompt("description", "cli_task")
+                title_task = get_prompt("title", "instructions")
+                description_task = get_prompt("description", "instructions")
                 with concurrent.futures.ThreadPoolExecutor() as executor:
                     futures = {
                         executor.submit(generate_details_for_chatbot, chatbot, title_task, description_task): chatbot

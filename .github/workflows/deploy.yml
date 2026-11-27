@@ -23,5 +23,7 @@ jobs:
             --env-file /home/bikimj03/medical-rag-chatbot/src/.env \
             -v rag-uploads:/app/src/uploads \
             -v rag-scorecards:/app/scorecards \
+            -v rag-bundles:/app/bundles \
+            -v rag-state:/app/state_store \
             rag-app:latest
           docker exec rag-app python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health', timeout=20).read()"

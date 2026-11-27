@@ -4,6 +4,7 @@ import random
 import re
 import time
 from typing import List
+import requests
 
 from langchain.schema import Document
 from weaviate.classes.config import Configure, DataType, Property, VectorDistances
@@ -77,11 +78,30 @@ _reranker_failed = False
 
 
 def text_to_embed(doc: Document) -> str:
-    """Tables are embedded from their two-sentence summary. The stored text stays the full table."""
+    """Embed table summaries or full text enriched with normalized biomedical entity aliases."""
     summary = doc.metadata.get("embed_text")
-    if isinstance(summary, str) and summary.strip():
-        return summary.strip()
-    return doc.page_content
+    base_text = summary.strip() if (isinstance(summary, str) and summary.strip()) else (doc.page_content or "")
+
+    aliases = doc.metadata.get("entity_aliases")
+    if not isinstance(aliases, list) or not aliases:
+        try:
+            from biomedical_nern import normalize_biomedical_text
+            aliases = normalize_biomedical_text(doc.page_content or "", max_extra_terms=6).get("expansion_terms") or []
+        except Exception:
+            aliases = []
+
+    if aliases:
+        alias_line = "Related biomedical terms: " + ", ".join(str(a) for a in aliases if a)
+        return f"{base_text}\n{alias_line}".strip()
+    return base_text
+
+
+def _text_list(value) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        return [part.strip() for part in value.split("|") if part.strip()]
+    return []
 
 
 def bbox_properties(metadata: dict) -> dict:
@@ -102,6 +122,10 @@ def metadata_from_properties(properties: dict) -> dict:
         "token_size": properties.get("token_size"),
         "chunk_index": int(raw_index) if raw_index is not None else None,
         "section_category": properties.get("section_category") or "Front matter",
+        "study_id": properties.get("study_id") or "",
+        "doc_role": properties.get("doc_role") or "main",
+        "concept_ids": _text_list(properties.get("concept_ids")),
+        "entity_aliases": _text_list(properties.get("entity_aliases")),
     }
     for key in BBOX_KEYS:
         raw = properties.get(key)
@@ -261,6 +285,10 @@ class WeaviateStoreMixin:
                         Property(name="token_size", data_type=DataType.INT),
                         Property(name="chunk_index", data_type=DataType.INT),
                         Property(name="section_category", data_type=DataType.TEXT),
+                        Property(name="study_id", data_type=DataType.TEXT),
+                        Property(name="doc_role", data_type=DataType.TEXT),
+                        Property(name="concept_ids", data_type=DataType.TEXT_ARRAY),
+                        Property(name="entity_aliases", data_type=DataType.TEXT_ARRAY),
                         Property(name="x0", data_type=DataType.NUMBER),
                         Property(name="y0", data_type=DataType.NUMBER),
                         Property(name="x1", data_type=DataType.NUMBER),
@@ -284,6 +312,10 @@ class WeaviateStoreMixin:
         wanted = {
             "chunk_index": DataType.INT,
             "section_category": DataType.TEXT,
+            "study_id": DataType.TEXT,
+            "doc_role": DataType.TEXT,
+            "concept_ids": DataType.TEXT_ARRAY,
+            "entity_aliases": DataType.TEXT_ARRAY,
             "x0": DataType.NUMBER,
             "y0": DataType.NUMBER,
             "x1": DataType.NUMBER,
@@ -387,13 +419,13 @@ class WeaviateStoreMixin:
         if not self.weaviate_client or not self.weaviate_client.is_ready():
             print("ERROR: Weaviate client is not ready in _index_chunks_in_weaviate.")
             return
-            
+
         print(f"Indexing {len(self.all_documents)} chunks...")
 
         # 1. Generate Embeddings via API
         texts = [text_to_embed(doc) for doc in self.all_documents]
         embeddings = self._get_embeddings_from_api(texts)
-        
+
         if not embeddings or len(embeddings) != len(self.all_documents):
             print("Error: Document/Embedding count mismatch or failed to get embeddings.")
             return
@@ -412,13 +444,17 @@ class WeaviateStoreMixin:
                         "token_size": doc.metadata.get("token_size"),
                         "chunk_index": doc.metadata.get("chunk_index", i),
                         "section_category": doc.metadata.get("section_category", "Front matter"),
+                        "study_id": doc.metadata.get("study_id") or "",
+                        "doc_role": doc.metadata.get("doc_role") or "main",
+                        "concept_ids": _text_list(doc.metadata.get("concept_ids")),
+                        "entity_aliases": _text_list(doc.metadata.get("entity_aliases")),
                     }
                     properties.update(bbox_properties(doc.metadata))
                     batch.add_object(
                         properties=properties,
                         vector=embeddings[i]
                     )
-            
+
             if len(collection.batch.failed_objects) > 0:
                 print(f"Failed to import {len(collection.batch.failed_objects)} objects.")
             else:
@@ -426,7 +462,7 @@ class WeaviateStoreMixin:
 
         except Exception as e:
             print(f"Error indexing chunks: {e}")
-        
+
         # KILL PIPELINE RAM: Explicitly delete the heavy vectors from memory
         del embeddings
         del texts
@@ -476,56 +512,143 @@ class WeaviateStoreMixin:
             print(f"Successfully loaded {len(self.all_documents)} documents.")
         except Exception as e:
             print(f"ERROR: Failed to load data: {e}")
-            
 
-    def _perform_hybrid_search(self, query: str, k: int = 20, exclude_references: bool = True) -> List[Document]:
+    def persist_study_tags(self, documents) -> int:
+        """Write study_id and doc_role onto chunks that are already stored.
+
+        Bundle tagging happens after the first index, so this updates properties
+        only. The stored vectors stay in place.
+        """
+        docs = [doc for doc in (documents or []) if isinstance(getattr(doc, "metadata", None), dict)]
+        if not docs:
+            return 0
+        client = getattr(self, "weaviate_client", None)
+        class_name = (getattr(self, "weaviate_class_name", "") or "").strip()
+        if client is None or not class_name:
+            print("ERROR: Weaviate client is not ready in persist_study_tags.")
+            return 0
+        try:
+            ready = client.is_ready()
+        except Exception:
+            ready = False
+        if not ready or not client.collections.exists(class_name):
+            print(f"ERROR: Collection '{class_name}' is not available. Study tags were not saved.")
+            return 0
+
+        self._ensure_schema_properties()
+        collection = client.collections.get(class_name)
+        uuid_by_index = {}
+        uuid_by_text = {}
+        if any(not doc.metadata.get("weaviate_id") for doc in docs):
+            response = collection.query.fetch_objects(limit=10000)
+            for obj in response.objects:
+                props = obj.properties or {}
+                raw_index = props.get("chunk_index")
+                if raw_index is not None:
+                    uuid_by_index[int(raw_index)] = str(obj.uuid)
+                text = props.get("text") or ""
+                if text and text not in uuid_by_text:
+                    uuid_by_text[text] = str(obj.uuid)
+
+        updated = 0
+        for doc in docs:
+            meta = doc.metadata
+            uid = str(meta.get("weaviate_id") or "")
+            if not uid:
+                raw_index = meta.get("chunk_index")
+                if raw_index is not None:
+                    uid = uuid_by_index.get(int(raw_index), "")
+                if not uid:
+                    uid = uuid_by_text.get(doc.page_content or "", "")
+            if not uid:
+                continue
+            meta["weaviate_id"] = uid
+            try:
+                collection.data.update(
+                    uuid=uid,
+                    properties={
+                        "study_id": meta.get("study_id") or "",
+                        "doc_role": meta.get("doc_role") or "main",
+                    },
+                )
+            except Exception as exc:
+                print(f"WARNING: Could not update study tags for {uid}: {exc}")
+                continue
+            updated += 1
+        print(f"Updated study tags on {updated} of {len(docs)} chunks in '{class_name}'.")
+        return updated
+
+    def _perform_hybrid_search(
+        self,
+        query: str,
+        k: int = 20,
+        exclude_references: bool = True,
+        study_id: str = "",
+        doc_roles: List[str] | None = None,
+        collection_name: str = "",
+    ) -> List[Document]:
         """
         Hybrid search with reciprocal rank fusion.
         Bibliography chunks are left out unless exclude_references is False.
+        Optionally filters by study_id and/or doc_role values (e.g., ["supplement", "protocol"]).
         """
         print("Executing Hybrid Search (RRF)...")
         if not self.weaviate_client or not self.weaviate_client.is_ready():
             print("ERROR: Weaviate client is not ready in _perform_hybrid_search.")
             return []
-            
-        collection = self.weaviate_client.collections.get(self.weaviate_class_name)
-        # Missing section_category (papers indexed before this field) still matches.
-        search_filter = None
+
+        class_name = (collection_name or self.weaviate_class_name or "").strip()
+        if collection_name and not self.weaviate_client.collections.exists(class_name):
+            print(f"Companion collection '{class_name}' is not in Weaviate. Skipping that hop.")
+            return []
+        collection = self.weaviate_client.collections.get(class_name)
+        conditions = []
         if exclude_references:
-            search_filter = Filter.any_of([
-                Filter.by_property("section_category").not_equal("References"),
-                Filter.by_property("section_category").is_none(True),
-            ])
+            conditions.append(
+                Filter.any_of([
+                    Filter.by_property("section_category").not_equal("References"),
+                    Filter.by_property("section_category").is_none(True),
+                ])
+            )
+        if study_id:
+            conditions.append(Filter.by_property("study_id").equal(study_id))
+        if doc_roles:
+            role_filters = [Filter.by_property("doc_role").equal(role) for role in doc_roles if role]
+            if role_filters:
+                combined_roles = role_filters[0]
+                for rf in role_filters[1:]:
+                    combined_roles = combined_roles | rf
+                conditions.append(combined_roles)
+
+        search_filter = None
+        if len(conditions) == 1:
+            search_filter = conditions[0]
+        elif len(conditions) > 1:
+            search_filter = Filter.all_of(conditions)
 
         # 1. Generate the Query Vector via API
         query_embeddings = self._get_embeddings_from_api([query], task_type="RETRIEVAL_QUERY")
         if not query_embeddings:
             return []
-        
+
         query_vector = query_embeddings[0]
 
         try:
             # 2. Execute Hybrid Query
             response = collection.query.hybrid(
-                # Keyword Component
                 query=query,
-                
-                # Vector Component
                 vector=query_vector,
-                
-                # Fusion Component (Reciprocal Rank Fusion)
-                fusion_type=HybridFusion.RANKED, 
-                
+                fusion_type=HybridFusion.RANKED,
                 limit=k,
                 filters=search_filter,
-                return_metadata=["score"]
+                return_metadata=["score"],
             )
-            
+
             docs = []
             for obj in response.objects:
                 metadata = metadata_from_properties(obj.properties)
                 docs.append(Document(page_content=obj.properties["text"], metadata=metadata))
-            
+
             return docs
 
         except Exception as e:
